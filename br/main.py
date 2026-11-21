@@ -105,10 +105,10 @@ def _bits(j):
     return b
 
 
-def line_mask(lines_by_file):
+def line_mask(lines_by_file, which="ulines"):
     mask = 0
     for rel, lines in lines_by_file.items():
-        ul = S.maps["ulines"].get(S.maps["files"].get(rel), {})
+        ul = S.maps[which].get(S.maps["files"].get(rel), {})
         for l in lines:
             j = ul.get(l)
             if j is not None:
@@ -117,27 +117,41 @@ def line_mask(lines_by_file):
 
 
 def state_mask(changed_keys):
-    """Pool calls that can see a changed class attribute or module global."""
+    """Pool calls and statement units that can see a changed class attribute or module global, as
+    (all of them, those whose later stage can). A unit sees a class attribute when it uses the class and runs
+    a line that names the attribute; when no line names it, using the class is enough."""
     mask = 0
+    late = 0
     for kind, owner, name in changed_keys:
         if kind == "d":
             where = function_lines((kind, owner, name))
             if where is not None:
-                mask |= line_mask({where[0]: where[1]})
+                lines = {where[0]: where[1]}
+                mask |= line_mask(lines)
+                late |= line_mask(lines, "ulines2")
                 continue
             kind = "c" if ":" in owner else "g"
+        refs = ref_lines(name) if not name.startswith("__") else {}
         if kind == "c" and S.maps["classes"].get(owner) is not None:
             j = S.maps["uclasses"].get(owner)
-            if j is not None:
-                mask |= _bits(j)
+            users = _bits(j) if j is not None else 0
+            if refs:
+                mask |= users & line_mask(refs)
+                late |= users & line_mask(refs, "ulines2")
+            else:
+                mask |= users
+                late |= users
         else:
-            mask |= line_mask(ref_lines(name) if not name.startswith("__") else {})
-    return mask
+            mask |= line_mask(refs)
+            late |= line_mask(refs, "ulines2")
+    return mask, late
 
 
-def affected_calls(plan, cands=None, extra_mask=0, with_stmts=False):
+def affected_calls(plan, cands=None, extra_mask=0, with_stmts=False, probes=False, extra_late=None):
     """{test number: set of pool-call indexes that must really run}, for tests that make pool calls."""
     mask = line_mask(plan.lines) | extra_mask
+    # calls whose later stage (after the optimizer run inside execute) can see the change cannot stop early
+    late = (line_mask(plan.lines, "ulines2") | (extra_mask if extra_late is None else extra_late)) if probes else None
     out = {}
     for n in (plan.cands if cands is None else cands):
         i = S.num2idx.get(n)
@@ -145,12 +159,20 @@ def affected_calls(plan, cands=None, extra_mask=0, with_stmts=False):
         if ub is None:
             continue
         base, nc, ns = ub
-        part = (mask >> base) & ((1 << (nc + ns)) - 1)
+        part = (mask >> base) & ((1 << (nc + ns + 1)) - 1)
         calls = {k for k in range(nc) if (part >> k) & 1}
+        # When the change is also seen outside the units (set-up, assignments between the statements), objects
+        # made there may carry it into any statement, so no statement is skipped. Pool calls are safe either
+        # way: everything they are given is pickled and compared.
+        rest_sees_it = (part >> (nc + ns)) & 1
         units = None
-        if with_stmts and ns and i not in S.no_stmt:
+        if with_stmts and ns and i not in S.no_stmt and not rest_sees_it:
             units = {k for k in range(ns) if (part >> (nc + k)) & 1}
-        out[n] = (calls, units)
+        probe = set()
+        if late is not None:
+            part2 = (late >> base) & ((1 << nc) - 1)
+            probe = {k for k in calls if not (part2 >> k) & 1}
+        out[n] = (calls, units, probe)
     return out
 
 
@@ -188,6 +210,7 @@ class Plan:
         self.statediff = False    # B: compare import state to find more suspects
         self.reuse_ok = True      # B: recorded pool-call results may be used for calls that cannot see the change
         self.broken = False       # B: a module no longer imports; test files are probed for import errors
+        self.swapped = set()      # A: files whose only change is function code that is patched in memory
         self.why = []
 
 
@@ -325,6 +348,8 @@ def analyze_python(plan, rel, old, new, changed):
     elif func_only and not ran_at_import:
         pairs = [(o, n) for o, n, _, p in out if p and C.is_function(o)]
         plan.swaps.append((rel, pairs))
+        if not openers(rel):
+            plan.swapped.add(rel)     # nobody reads this file's text, so no tree on disk has to show the change
         if plan.mode in ("none", "files"):
             plan.mode = "A"
         plan.why.append(f"{rel}: {len(own)} function(s)")
@@ -622,15 +647,16 @@ def run_policy(fd, cands, runner, calls=None, min_evidence=5):
     v = S.v
     if calls:
         v = dict(v)
-        for n, (aff, units) in calls.items():
+        for n, (aff, units, probe) in calls.items():
             frac = S.maps["call_frac"].get(S.num2idx[n])
             if frac:
                 nc = S.maps["unit_base"][S.num2idx[n]][1]
                 saved = sum(f for k, f in enumerate(frac[:nc]) if k not in aff)
+                saved += 0.8 * sum(frac[k] for k in probe)        # the first stage is about a fifth of a call
                 if units is not None:
                     saved += sum(f for k, f in enumerate(frac[nc:]) if k not in units)
                 v[n] = S.v[n] * max(0.05, 1.0 - saved)
-    order = sorted((n for n in cands if S.base_ok.get(n, True)), key=lambda n: v[n])
+    testable = [n for n in cands if S.base_ok.get(n, True)]
     remaining = set(cands)                       # not shown to pass
     rem_total = sum(ms[n] for n in remaining)
     rem_big = max((ms[n] for n in remaining), default=0)
@@ -639,7 +665,9 @@ def run_policy(fd, cands, runner, calls=None, min_evidence=5):
     # expensive one is taken to pass too (measured on the pinned commit: 44 of 44 synthetic changes).
     costly = set()
     if S.risk and min_evidence is not None:
-        costly = {n for n in order if v[n] > COSTLY_S and S.id_of[n].endswith(ASSUME_PASS)}
+        costly = {n for n in testable if v[n] > COSTLY_S and S.id_of[n].endswith(ASSUME_PASS)}
+    # costly tests go last: the rule above needs every cheap test to have passed first
+    order = sorted(testable, key=lambda n: (n in costly, v[n]))
     cheap_passed = 0
     cheap_skipped = False
     k = len(order)
@@ -672,10 +700,15 @@ def run_policy(fd, cands, runner, calls=None, min_evidence=5):
         else:
             big2 = rem_big if ms[n] < rem_big else max((ms[x] for x in remaining if x != n), default=0)
             delta = (include_cost(rem_total, rem_big) - include_cost(rem_total - ms[n], big2)) / 1000
-            if 0.5 * delta <= 0.6 * v[n]:
+            # Worth verifying when the expected saving beats the expected CPU: a test that passes costs its
+            # full time to verify, one that fails stops at its first failing part (taken as 2 s at most).
+            if S.debug and ms[n] >= HEAVY_MS:
+                C.log(f"   after a failure: {S.id_of[n].rsplit('::', 1)[1]} saves {delta:.1f}s if it passes, "
+                      f"costs {v[n]:.1f}s to verify (unreduced {S.v[n]:.1f}s)")
+            if delta <= v[n] + min(v[n], 2.0):
                 continue
         limit = max(3.0, 3.0 * max(v[n], ms[n] / 1000) + 2.0)
-        C.FC.reuse = C.FC.affected = None
+        C.FC.reuse = C.FC.affected = C.FC.probe = None
         stmts.SU.affected = None
         if calls and n in calls:
             stmts.SU.affected = calls[n][1]
@@ -684,8 +717,9 @@ def run_policy(fd, cands, runner, calls=None, min_evidence=5):
                     with open(os.path.join(C.MAPS, "fut", f"{S.num2idx[n]}.pkl"), "rb") as f:
                         C.FC.reuse = pickle.load(f)
                     C.FC.affected = calls[n][0]
+                    C.FC.probe = calls[n][2]
                 except Exception:
-                    C.FC.reuse = C.FC.affected = None
+                    C.FC.reuse = C.FC.affected = C.FC.probe = None
         t_run = time.process_time()
         try:
             C.arm(60.0)
@@ -726,7 +760,11 @@ def child_main(fd, plan):
     cands = set(plan.cands)
     state_keys = None
     ov = None
-    if plan.changes:
+    # Files a test may read from disk. In mode A the patched functions live in memory, so only other changed
+    # files (fixtures, sources some test opens) need a tree that shows them.
+    on_disk = dict(plan.changes) if plan.mode != "A" else \
+        {r: d for r, d in plan.changes.items() if r not in plan.swapped}
+    if on_disk:
         ov = os.path.join(C.TMP, f"ov_{os.getpid()}")
         C.build_overlay(C.ROOT, ov, plan.changes)
     # DuckDB answers are keyed by query text, so they stay valid unless the data files themselves change.
@@ -790,12 +828,14 @@ def child_main(fd, plan):
     # Recorded pool-call results may stand in for calls that run no changed statement. A changed .sql fixture
     # reaches a call only through its pickled arguments, which are compared; any other changed file rules it out.
     calls = None
-    only_sql = all(r.endswith(".sql") for r in plan.changes)
+    only_sql = all(r.endswith(".sql") for r in on_disk)
     if only_sql and (plan.mode == "files" or (plan.mode == "A" and not S.conflict_now)):
-        calls = affected_calls(plan, cands, 0, S.stmt and plan.mode == "A" and ov is None)
+        calls = affected_calls(plan, cands, 0, S.stmt and plan.mode == "A" and ov is None,
+                               probes=plan.mode == "A" and ov is None)
     elif plan.mode == "B" and plan.reuse_ok and state_keys is not None:
         try:
-            calls = affected_calls(plan, cands, state_mask(state_keys), S.stmt)
+            seen, seen_late = state_mask(state_keys)
+            calls = affected_calls(plan, cands, seen, S.stmt, probes=True, extra_late=seen_late)
         except Exception as e:
             C.log("   no reuse:", repr(e)[:100])
             calls = None

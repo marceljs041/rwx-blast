@@ -71,10 +71,12 @@ def traced(fn, inits, per_call=False):
     types_seen = set()
     opened = set()
     call_lines = {}   # (file, line) -> bitmask of calls
+    call_lines2 = {}  # the same, for the later stage of staged calls only
     state = {"sink": lines, "cur": None, "types": None, "t0": 0.0}
     call_types = {}   # k -> types instantiated inside that call
     setup_types = set()
     rest_types = set()   # instantiated outside every unit: such objects can be used by any statement unit
+    unit_lines = set()   # lines run inside any unit; `lines` itself only collects what runs outside units
     stmt_lines = {}   # (file, line) -> bitmask of statement units
     stmt_types = {}
     stmt_cpu = {}
@@ -111,16 +113,28 @@ def traced(fn, inits, per_call=False):
         if phase == 3:
             state["types"] = None
             return
+        if phase == 4:                       # first stage of a staged call is over
+            state["cur2"] = set()
+            trace_into(state["cur2"])
+            mon.restart_events()
+            return
         if phase == 0:
             state["cur"] = set()
+            state["cur2"] = None
             state["types"] = call_types.setdefault(k, set())
             trace_into(state["cur"])
         else:
             state["types"] = None
+            if state["cur2"] is not None:
+                bit2 = 1 << k
+                for key in state["cur2"]:
+                    call_lines2[key] = call_lines2.get(key, 0) | bit2
+                state["cur"] |= state["cur2"]
+                state["cur2"] = None
             bit = 1 << k
             for key in state["cur"]:
                 call_lines[key] = call_lines.get(key, 0) | bit
-            lines.update(state["cur"])
+            unit_lines.update(state["cur"])
             trace_into(lines)
         mon.restart_events()
 
@@ -137,7 +151,7 @@ def traced(fn, inits, per_call=False):
             bit = 1 << k
             for key in state["cur"]:
                 stmt_lines[key] = stmt_lines.get(key, 0) | bit
-            lines.update(state["cur"])
+            unit_lines.update(state["cur"])
             trace_into(lines)
             mon.restart_events()
 
@@ -180,10 +194,11 @@ def traced(fn, inits, per_call=False):
                 for key in keys_of(ts):
                     out[key] = out.get(key, 0) | (1 << k)
             return out
-        calls = dict(record=C.FC.record, lines=call_lines, classes=class_masks(call_types),
+        calls = dict(record=C.FC.record, lines=call_lines, lines2=call_lines2, classes=class_masks(call_types),
+                     rest_lines=set(lines),
                      setup_classes=keys_of(setup_types), rest_classes=keys_of(rest_types),
                      stmt_lines=stmt_lines, stmt_classes=class_masks(stmt_types), stmt_cpu=stmt_cpu)
-    return dict(result=result, cpu=cpu, lines=lines, classes=classes, opened=opened, calls=calls)
+    return dict(result=result, cpu=cpu, lines=lines | unit_lines, classes=classes, opened=opened, calls=calls)
 
 
 def run_pool(jobs, workers, tmpdir):
@@ -448,9 +463,11 @@ def main():
     unit_base = {}
     call_frac = {}
     masks = {}
+    masks2 = {}
     cmasks = {}
     n_units = 0
     n_stmt_units = 0
+    n_staged = 0
     payload_bytes = 0
     for i, tid in enumerate(ids):
         tr = traces.get(i)
@@ -461,18 +478,26 @@ def main():
         scpu = calls["stmt_cpu"]
         n = (max(rec) + 1) if rec else 0           # pool calls come first in the test's unit range
         ns = (max(scpu) + 1) if scpu else 0        # then its statement units
-        unit_base[i] = (n_units, n, ns)
+        unit_base[i] = (n_units, n, ns)             # the bit after the last unit stands for the rest of the test
+        rest_bit = 1 << (n_units + n + ns)
+        for fn, line in calls["rest_lines"]:
+            key = (fidx(fn), line)
+            masks[key] = masks.get(key, 0) | rest_bit
         n_stmt_units += ns
         total = max(tr["cpu"], 1e-6)
         call_frac[i] = [min(1.0, rec[k][2] / total) if k in rec else 0.0 for k in range(n)] + \
                        [min(1.0, scpu.get(k, 0.0) / total) for k in range(ns)]
         if rec:
             with open(os.path.join(fut_dir, f"{i}.pkl"), "wb") as f:
-                pickle.dump({k: (h, out) for k, (h, out, _) in rec.items()}, f, protocol=5)
-            payload_bytes += sum(len(out) for _, out, _ in rec.values() if out)
+                pickle.dump({k: (r[0], r[1], r[3]) for k, r in rec.items()}, f, protocol=5)
+            payload_bytes += sum(len(r[1]) for r in rec.values() if r[1])
+            n_staged += sum(1 for r in rec.values() if r[3] is not None)
         for (fn, line), m in calls["lines"].items():
             key = (fidx(fn), line)
             masks[key] = masks.get(key, 0) | (m << n_units)
+        for (fn, line), m in calls["lines2"].items():
+            key = (fidx(fn), line)
+            masks2[key] = masks2.get(key, 0) | (m << n_units)
         for (fn, line), m in calls["stmt_lines"].items():
             key = (fidx(fn), line)
             masks[key] = masks.get(key, 0) | (m << (n_units + n))
@@ -483,10 +508,10 @@ def main():
         for key, m in calls["stmt_classes"].items():
             cmasks[key] = cmasks.get(key, 0) | (m << (n_units + n))
         for key in calls["setup_classes"]:
-            cmasks[key] = cmasks.get(key, 0) | ((every_call | every_stmt) << n_units)
+            cmasks[key] = cmasks.get(key, 0) | ((every_call | every_stmt) << n_units) | rest_bit
         for key in calls["rest_classes"]:
-            cmasks[key] = cmasks.get(key, 0) | (every_stmt << n_units)
-        n_units += n + ns
+            cmasks[key] = cmasks.get(key, 0) | (every_stmt << n_units) | rest_bit
+        n_units += n + ns + 1
     nbytes = (n_units + 7) // 8
     bitsets = {}
     ulines = {}
@@ -496,6 +521,13 @@ def main():
         if j is None:
             j = bitsets[b] = len(bitsets)
         ulines.setdefault(f, {})[line] = j
+    ulines2 = {}
+    for (f, line), m in masks2.items():
+        b = m.to_bytes(nbytes, "little")
+        j = bitsets.get(b)
+        if j is None:
+            j = bitsets[b] = len(bitsets)
+        ulines2.setdefault(f, {})[line] = j
     uclasses = {}
     for key, m in cmasks.items():
         b = m.to_bytes(nbytes, "little")
@@ -506,7 +538,8 @@ def main():
     bit_list = [None] * len(bitsets)
     for b, j in bitsets.items():
         bit_list[j] = b
-    C.log(f"units: {n_units - n_stmt_units} pool calls and {n_stmt_units} statements in {len(unit_base)} tests, "
+    C.log(f"units: {n_units - n_stmt_units - len(unit_base)} pool calls ({n_staged} staged) and {n_stmt_units} statements "
+          f"in {len(unit_base)} tests, "
           f"{payload_bytes // 1024} KiB of results, {len(bit_list)} distinct unit sets, "
           f"{len(no_stmt)} tests with dependent statements")
 
@@ -533,7 +566,7 @@ def main():
     maps = dict(
         tests=ids, files=files, sets=set_list, lines=lines, import_lines=imp,
         import_funcs=import_funcs, unstable=unstable, lazy=lazy,
-        unit_base=unit_base, call_frac=call_frac, ulines=ulines, uclasses=uclasses, ubits=bit_list,
+        unit_base=unit_base, call_frac=call_frac, ulines=ulines, ulines2=ulines2, uclasses=uclasses, ubits=bit_list,
         no_stmt=no_stmt,
         classes=class_sets, opened=open_sets,
         setup=setup_info, v=v, base_ok=base_ok, core_modules=core,

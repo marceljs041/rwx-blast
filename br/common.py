@@ -178,17 +178,48 @@ class FutureCtx:
     reuse = None      # {k: (input_hash, pickled_result)} recorded on the pinned commit
     affected = None   # calls that execute a changed statement and must really run
     hook = None       # build time: called with (0|1, k) around each call
-    record = None     # build time: {k: (input_hash, pickled_result | None, cpu)}
+    record = None     # build time: {k: (input_hash, pickled_result | None, cpu, stage_hash | None)}
+    probe = None      # calls whose later stage runs no changed statement: stop after the first stage if its
+                      # output is byte-identical to the pinned commit's
+    cur = None        # the call that is running right now
 
 
 FC = FutureCtx()
 
 
-def input_hash(fn, payload):
+def input_hash(fn, payload, pool=None):
+    """Everything a pool call is given: its function, its pickled arguments, and the pickled arguments of the
+    worker initializer of its pool (the state a spawned worker would start from)."""
     h = hashlib.blake2b(payload, digest_size=12)
     h.update(getattr(fn, "__module__", "").encode())
     h.update(getattr(fn, "__qualname__", "").encode())
+    if pool is not None:
+        h.update(pool._init_hash)
     return h.digest()
+
+
+class _Reuse(BaseException):
+    """Raised inside a pool call when its first stage reproduced the pinned commit's output exactly."""
+
+
+def stage_done(value):
+    """Called when the first stage of a staged pool call (the optimizer run inside `execute`) returns."""
+    fut = FC.cur
+    if fut is None or fut._staged:
+        return
+    fut._staged = True
+    if FC.record is None and fut._want is None:
+        return
+    try:
+        h = hashlib.blake2b(pickle.dumps(value), digest_size=12).digest()
+    except Exception:
+        return
+    fut._stage_hash = h
+    if FC.record is not None:
+        if FC.hook:
+            FC.hook(4, fut._k)            # build time: lines from here on belong to the later stage
+    elif h == fut._want:
+        raise _Reuse()
 
 
 class LazyFuture:
@@ -197,13 +228,17 @@ class LazyFuture:
     When the same call, with byte-identical pickled arguments, was made on the pinned commit and executes no
     changed statement, its recorded result is unpickled instead of being computed again."""
 
-    def __init__(self, fn, args, kwargs):
+    def __init__(self, fn, args, kwargs, pool=None):
         self._fn = fn
         self._exc = None
         self._res = None
         self._state = 0
+        self._pool = pool
         self._test = FC.test
         self._k = FC.count
+        self._staged = False
+        self._stage_hash = None
+        self._want = None
         FC.count += 1
         try:
             self._payload = pickle.dumps((args, kwargs))
@@ -218,36 +253,53 @@ class LazyFuture:
         k = self._k
         mine = self._test is not None and self._test is FC.test
         in_unit = stmts.SU.active
-        if mine and not in_unit and FC.reuse is not None and FC.affected is not None and k not in FC.affected:
+        ent = None
+        if mine and not in_unit and FC.reuse is not None and FC.affected is not None:
             ent = FC.reuse.get(k)
-            if ent is not None and ent[1] is not None and ent[0] == input_hash(self._fn, self._payload):
-                try:
-                    self._res = pickle.loads(ent[1])
-                except Timeout:
-                    raise
-                except BaseException as e:
-                    self._exc = e
-                self._state = 2
-                return
+            if ent is not None and (ent[1] is None or ent[0] != input_hash(self._fn, self._payload, self._pool)):
+                ent = None
+        if ent is not None and k not in FC.affected:
+            self._load(ent[1])
+            return
+        if ent is not None and FC.probe is not None and k in FC.probe and len(ent) > 2 and ent[2] is not None:
+            self._want = ent[2]
+        if self._pool is not None:
+            self._pool._ensure_init()
         hook = FC.hook if (mine and not in_unit) else None
         if hook:
             hook(0, k)
         t0 = time.process_time()
         out = None
+        prev, FC.cur = FC.cur, (self if (mine and not in_unit) else None)
         try:
             a, kw = pickle.loads(self._payload)
             out = pickle.dumps(self._fn(*a, **kw))
             self._res = pickle.loads(out)
         except Timeout:
+            FC.cur = prev
             raise
+        except _Reuse:
+            FC.cur = prev
+            self._load(ent[1])
+            return
         except BaseException as e:
             self._exc = e
             out = None
+        FC.cur = prev
         if hook:
             hook(1, k)
         if mine and FC.record is not None:
-            FC.record[k] = (input_hash(self._fn, self._payload), None if in_unit else out,
-                            0.0 if in_unit else time.process_time() - t0)
+            FC.record[k] = (input_hash(self._fn, self._payload, self._pool), None if in_unit else out,
+                            0.0 if in_unit else time.process_time() - t0, None if in_unit else self._stage_hash)
+        self._state = 2
+
+    def _load(self, payload):
+        try:
+            self._res = pickle.loads(payload)
+        except Timeout:
+            raise
+        except BaseException as e:
+            self._exc = e
         self._state = 2
 
     def result(self, timeout=None):
@@ -268,18 +320,32 @@ class LazyFuture:
 
 
 class InlinePool:
+    """Runs submitted calls in this process, on first use of their result. The worker initializer runs before
+    the first call that really executes, so a test whose calls all reuse recorded results never pays for it."""
+
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
+        self._init = None
+        self._init_hash = b""
         if initializer is not None:
-            if FC.hook:
-                FC.hook(2, -1)
-            initializer(*pickle.loads(pickle.dumps(initargs)))
-            if FC.hook:
-                FC.hook(3, -1)
+            payload = pickle.dumps(initargs)
+            self._init = (initializer, payload)
+            self._init_hash = hashlib.blake2b(payload, digest_size=12).digest()
+
+    def _ensure_init(self):
+        if self._init is None:
+            return
+        (initializer, payload), self._init = self._init, None
+        if FC.hook:
+            FC.hook(2, -1)
+        initializer(*pickle.loads(payload))
+        if FC.hook:
+            FC.hook(3, -1)
 
     def submit(self, fn, /, *args, **kwargs):
-        return LazyFuture(fn, args, kwargs)
+        return LazyFuture(fn, args, kwargs, self)
 
     def map(self, fn, *iterables, **kw):
+        self._ensure_init()
         return [fn(*pickle.loads(pickle.dumps(a))) for a in zip(*iterables)]
 
     def shutdown(self, wait=True, cancel_futures=False):
@@ -575,6 +641,7 @@ def warm():
             importlib.import_module(m.name)
         except Exception as e:
             log("skip module", m.name, repr(e)[:80])
+    patch_stages()
 
 
 # ---------------------------------------------------------------- DuckDB connections
@@ -635,6 +702,26 @@ class LazyConn:
 
     def __getattr__(self, name):
         return getattr(self._real(), name)
+
+
+def patch_stages():
+    """Marks the end of the first stage of `sqlglot.executor.execute`: its optimizer run. What follows
+    (planning and running the plan) depends on the code only through that stage's output, plus the lines the
+    later stage itself executes, which are recorded separately."""
+    ex = sys.modules.get("sqlglot.executor")
+    real = getattr(ex, "optimize", None) if ex else None
+    if real is None or getattr(real, "__br_stage__", False):
+        return
+
+    def optimize(*a, **k):
+        out = real(*a, **k)
+        if FC.cur is not None:
+            stage_done(out)
+        return out
+
+    optimize.__br_stage__ = True
+    optimize.__wrapped__ = real
+    ex.optimize = optimize
 
 
 def patch_duckdb():
@@ -740,4 +827,5 @@ def reimport(ov):
         except Exception as e:
             failed.append(m.name)
             log("import failed", m.name, repr(e)[:120])
+    patch_stages()
     return failed

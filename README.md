@@ -41,9 +41,22 @@ A suspect test is not always run in full:
   build time and never have statements skipped.
 - A DuckDB query whose exact text was answered on the pinned commit is not executed again.
 
-One rule is statistical rather than exact: when at least five cheaper tests execute the changed statement and
-all pass, `test_execute_tpcds` is taken to pass (`BR_RISK=0` turns this off). On 44 synthetic changes of that
-kind the test passed 44 times.
+An executor pool call is also split at its optimizer run: when only that stage can see the change and its
+output is byte-identical to the pinned commit's, the recorded result is used and planning and execution are
+skipped.
+
+Two rules are statistical rather than exact (`BR_RISK=0` turns both off):
+
+- When at least five cheaper tests execute the changed statement and all pass, `test_execute_tpcds` is taken
+  to pass. On 44 synthetic changes of that kind the test passed 44 times. Where the staged check above makes
+  that test cheap to verify, it is verified instead.
+- When a patch swaps `is` and `==` (or `is not` and `!=`) in one comparison, the patched function is compiled
+  so that both operators are applied to the same operands and disagreements are counted (`br/dual.py`). A test
+  in which they never disagree behaves exactly as on the pinned commit. Once the comparison has run 30 times
+  in 3 passing tests, always against `None`, `True`, `False`, a class or an enum member, and never disagreed,
+  the remaining suspects are taken to pass. On 116 synthetic swaps whose runs were all of that kind, old and
+  new never disagreed in any test and no test failed; without the restriction to those operands the same rule
+  was wrong 3 to 11 times in about 150, so it is not applied to other comparisons.
 
 ## Layout
 
@@ -51,6 +64,7 @@ kind the test passed 44 times.
 - `br/common.py` — patch parsing, overlay trees, inline pool, test runner, code-object diff, packing.
 - `br/statediff.py` — fingerprints of imported classes and module globals.
 - `br/stmts.py` — rewrites test methods into skippable statement units.
+- `br/dual.py` — counts disagreements between the old and new operator of a swapped comparison.
 - `br/build_maps.py` — build-time tracer.
 - `br/main.py` — run-time selector.
 

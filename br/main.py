@@ -17,6 +17,7 @@ from array import array
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from br import common as C
+from br import dual
 from br import statediff
 from br import stmts
 
@@ -25,6 +26,8 @@ PYTEST_CONFIG = re.compile(r"^\[(tool\.pytest|pytest|tool:pytest)", re.M)
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini"}
 HEAVY_MS = 3000
 COSTLY_S = 3.0
+# (runs of the changed comparison, passing tests) needed before stopping early; "" turns it off
+DUAL_STOP = "30,3"
 # The only test the skip rule was measured for.
 ASSUME_PASS = ("::TestExecutor::test_execute_tpcds",)
 
@@ -35,6 +38,14 @@ class State:
 
 class NeedReimport(Exception):
     pass
+
+
+PHASES = {}
+
+
+def phase(name, t0):
+    """Adds CPU spent since t0 to a named bucket (reported with BR_DEBUG)."""
+    PHASES[name] = PHASES.get(name, 0.0) + time.process_time() - t0
 
 
 S = State()
@@ -211,6 +222,7 @@ class Plan:
         self.reuse_ok = True      # B: recorded pool-call results may be used for calls that cannot see the change
         self.broken = False       # B: a module no longer imports; test files are probed for import errors
         self.swapped = set()      # A: files whose only change is function code that is patched in memory
+        self.dual = False         # A: the one changed comparison is counted (see dual.py)
         self.why = []
 
 
@@ -347,6 +359,18 @@ def analyze_python(plan, rel, old, new, changed):
         plan.why.append(f"{rel}: test code")
     elif func_only and not ran_at_import:
         pairs = [(o, n) for o, n, _, p in out if p and C.is_function(o)]
+        if S.dual and len(own) == 1:
+            counted = dual.instrument(old, new, path)
+            if counted is not None:
+                out2 = []
+                try:
+                    C.diff_tree(ocode, counted, [], out2)
+                    pairs2 = [(o, n) for o, n, _, p in out2 if p and C.is_function(o)]
+                    if len(pairs2) == len(pairs) and all(a[0] is b[0] for a, b in zip(pairs, pairs2)):
+                        pairs = pairs2
+                        plan.dual = True
+                except ValueError:
+                    pass
         plan.swaps.append((rel, pairs))
         if not openers(rel):
             plan.swapped.add(rel)     # nobody reads this file's text, so no tree on disk has to show the change
@@ -442,7 +466,10 @@ def force_all(plan, why):
 def ensure_warm():
     if S.warm:
         return
+    t0 = time.process_time()
     C.warm()
+    phase("warm import", t0)
+    t0 = time.process_time()
     S.warm = True
     idx = {}
     root = C.ROOT + "/"
@@ -456,6 +483,7 @@ def ensure_warm():
     S.runner.after_setup = after_setup
     S.runner.instrument = S.stmt
     gc.freeze()
+    phase("function index", t0)
 
 
 def after_setup(c):
@@ -639,7 +667,7 @@ def include_cost(total, big):
     return min(C.WORKER_MS * k + max(big, -(-total // k)) for k in range(1, 9))
 
 
-def run_policy(fd, cands, runner, calls=None, min_evidence=5):
+def run_policy(fd, cands, runner, calls=None, min_evidence=5, dual_stop=None):
     """Verifies suspects cheapest first, and stops verifying where including a test costs less than running it.
     `calls` maps a test to the pool calls and statement units that must really run; its other units are
     skipped or reuse recorded results."""
@@ -743,6 +771,17 @@ def run_policy(fd, cands, runner, calls=None, min_evidence=5):
             emit(fd, f"P {n}")
             if n not in costly:
                 cheap_passed += 1
+            # The patch swaps `is` and `==` (or their negations), every run so far compared against None,
+            # True, False, a class or an enum member, and old and new operator never disagreed: every test so
+            # far behaved exactly as on the pinned commit, and the rest are taken to do the same.
+            if dual_stop and not fails and dual.Tally.diverged == 0 and dual.Tally.open_ended == 0 \
+                    and dual.Tally.count >= dual_stop[0] and cheap_passed >= dual_stop[1]:
+                rest = [m for m in order[i + 1:] if m in remaining]
+                for m in rest:
+                    emit(fd, f"P {m}")
+                C.log(f"   old and new operator agreed {dual.Tally.count} times in {cheap_passed} tests; "
+                      f"{len(rest)} remaining tests taken to pass")
+                break
         else:
             fails.append(n)
             emit(fd, f"F {n}")
@@ -760,6 +799,7 @@ def child_main(fd, plan):
     cands = set(plan.cands)
     state_keys = None
     ov = None
+    tc = time.process_time()
     # Files a test may read from disk. In mode A the patched functions live in memory, so only other changed
     # files (fixtures, sources some test opens) need a tree that shows them.
     on_disk = dict(plan.changes) if plan.mode != "A" else \
@@ -776,6 +816,8 @@ def child_main(fd, plan):
             C.log("   sqlglot does not import:", repr(e)[:200])
             emit(fd, "C " + " ".join(map(str, S.all)))
             return
+        emit(fd, f"T re-import {time.process_time() - tc:.3f}")
+        tc = time.process_time()
         if failed:
             # A module that no longer imports breaks every test that would load it, including tests that
             # only look a dialect up by name. The maps cannot tell those apart, so every test is a suspect.
@@ -794,6 +836,9 @@ def child_main(fd, plan):
                 cands = set(S.all)
             if cands:
                 cands.update(S.unknown)
+        if plan.statediff:
+            emit(fd, f"T state diff {time.process_time() - tc:.3f}")
+        tc = time.process_time()
         if plan.broken and len(cands) < len(S.all):
             # every test of a file that can no longer be imported fails
             for f, numbers in S.by_file.items():
@@ -825,6 +870,8 @@ def child_main(fd, plan):
             runner.after_setup = after_setup
             runner.instrument = S.runner.instrument
     emit(fd, "C " + " ".join(map(str, sorted(cands))))
+    emit(fd, f"T child prepare {time.process_time() - tc:.3f}")
+    tc = time.process_time()
     # Recorded pool-call results may stand in for calls that run no changed statement. A changed .sql fixture
     # reaches a call only through its pickled arguments, which are compared; any other changed file rules it out.
     calls = None
@@ -839,7 +886,12 @@ def child_main(fd, plan):
         except Exception as e:
             C.log("   no reuse:", repr(e)[:100])
             calls = None
-    run_policy(fd, cands, runner, calls, min_evidence=5 if plan.mode == "A" else None)
+    emit(fd, f"T unit selection {time.process_time() - tc:.3f}")
+    tc = time.process_time()
+    dual.Tally.count = dual.Tally.diverged = dual.Tally.open_ended = 0
+    run_policy(fd, cands, runner, calls, min_evidence=5 if plan.mode == "A" else None,
+               dual_stop=S.dual_stop if (plan.mode == "A" and plan.dual and S.risk) else None)
+    emit(fd, f"T tests {plan.mode} {time.process_time() - tc:.3f}")
 
 
 def run_child(plan):
@@ -893,6 +945,10 @@ def run_child(plan):
     for line in buf.decode().split("\n"):
         if line == "X":
             return "reimport"
+        if line.startswith("T "):
+            name, _, sec = line[2:].rpartition(" ")
+            PHASES[name] = PHASES.get(name, 0.0) + float(sec)
+            continue
         if line.startswith("C"):
             cands = {int(x) for x in line[1:].split()}
         elif line.startswith("P "):
@@ -918,9 +974,14 @@ def decide(plan):
     S.conflict_now = setup_conflict(plan)
     if plan.mode == "B":
         if plan.statediff and S.fp0 is None:
+            t0 = time.process_time()
             S.fp0 = statediff.snapshot(S.maps["unstable"])
+            phase("baseline state snapshot", t0)
     else:
+        t0 = time.process_time()
         import_tests(sorted(plan.cands))
+        phase("test module imports", t0)
+        t0 = time.process_time()
         if not S.conflict_now:
             for n in sorted(plan.cands):
                 k = class_key(n)
@@ -932,6 +993,7 @@ def decide(plan):
                     except BaseException as e:
                         C.log("set-up in warm process failed", k, repr(e)[:100])
                     S.prepared.add(k)
+        phase("class set-up in warm process", t0)
     res = run_child(plan)
     if res == "reimport":
         plan.mode = "B"
@@ -982,6 +1044,9 @@ def run(out_fd):
     S.risk = os.environ.get("BR_RISK", "1") != "0"
     S.stmt = os.environ.get("BR_STMT", "1") != "0"
     S.debug = os.environ.get("BR_DEBUG", "0") != "0"
+    S.dual = os.environ.get("BR_DUAL", "1") != "0"
+    stop = os.environ.get("BR_DUAL_STOP", DUAL_STOP)
+    S.dual_stop = tuple(int(x) for x in stop.split(",")) if stop else None
     S.no_stmt = set(S.maps.get("no_stmt", ()))
     plans = []
     for c in commits:
@@ -1010,6 +1075,8 @@ def run(out_fd):
     os.write(out_fd, ("\n".join(lines) + "\n").encode())
     ru = resource.getrusage(resource.RUSAGE_SELF)
     rc = resource.getrusage(resource.RUSAGE_CHILDREN)
+    if S.debug:
+        C.log("phases: " + ", ".join(f"{k} {v:.2f}" for k, v in sorted(PHASES.items(), key=lambda kv: -kv[1])))
     C.log(f"analysis {t_an:.2f}s  wall {time.time() - T0:.1f}s  cpu {ru.ru_utime + ru.ru_stime + rc.ru_utime + rc.ru_stime:.2f}s")
 
 

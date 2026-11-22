@@ -35,7 +35,11 @@ Run time (`br/main.py`), per patch:
    added or removed, the suspects are the tests that run a pinned function the patched file no longer holds
    in identical form, plus those found through the import state.
 4. A change to a data file: tests that open it are run against the overlay tree.
-5. Anything not understood selects every test.
+5. A module that no longer imports: when plain `import sqlglot` still works, the suspects are the tests that
+   run code of the failed modules, make objects of their classes, run an import statement or a line naming
+   one of their classes, read an entry now missing from a registry (the dialect registry is one of the
+   recorded tables), or sit in a test file that no longer imports. Otherwise every test is selected.
+6. Anything not understood selects every test.
 
 sqlglot builds one table lazily: the dispatch table of each generator class, the first time the class is
 instantiated, kept in `sqlglot.generator._DISPATCH_CACHE`. Both at build time and after every re-import these

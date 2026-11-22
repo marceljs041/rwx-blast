@@ -764,6 +764,69 @@ def suspects_from_state(changed_keys, old_modules=None):
     return out, f"{len(changed_keys)} state changes" + (f", entry reads spare {narrowed} tests" if narrowed else "")
 
 
+def _imported_names(node, modname, is_package):
+    """Absolute names of the modules an import statement can load."""
+    if isinstance(node, ast.Import):
+        out = []
+        for a in node.names:
+            parts = a.name.split(".")
+            out.extend(".".join(parts[:i]) for i in range(1, len(parts) + 1))
+        return out
+    base = node.module or ""
+    if node.level:
+        pkg = modname if is_package else modname.rpartition(".")[0]
+        for _ in range(node.level - 1):
+            pkg = pkg.rpartition(".")[0]
+        base = f"{pkg}.{base}" if base else pkg
+    return [base] + [f"{base}.{a.name}" for a in node.names]
+
+
+def users_of_failed(failed, old_modules):
+    """Tests that can notice that the modules in `failed` no longer import, or None when that cannot be
+    narrowed down. A test needs such a module when it runs code of it, makes an object of one of its classes,
+    runs an import statement or a line that names one of its classes, or reads an entry that is now missing
+    from a registry (the dialect registry is a table whose reads were recorded). Test files that import one
+    are probed by the caller."""
+    bad = set(failed)
+    if S.fp0 is None or bad & set(S.maps["core_modules"]):
+        return None                              # plain `import sqlglot` is broken: nearly everything fails
+    out = set()
+    for m in bad:
+        mod = old_modules.get(m)
+        path = getattr(mod, "__file__", None)
+        if mod is None or not path or not path.startswith(C.ROOT + "/"):
+            return None
+        f = S.maps["files"].get(path[len(C.ROOT) + 1:])
+        if f is not None:
+            for sid in set(S.maps["lines"].get(f, {}).values()):
+                out |= members(sid)
+        for name, v in list(vars(mod).items()):
+            if isinstance(v, type) and v.__module__ == m:
+                out |= readers(name)[0]
+    for key, sid in S.maps["classes"].items():
+        if key.split(":", 1)[0] in bad:
+            out |= members(sid)
+    for rel, text in _sources().items():
+        if "import" not in text:
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        modname = module_name(rel)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)) and \
+                    bad.intersection(_imported_names(node, modname, rel.endswith("__init__.py"))):
+                out |= tests_for_lines(rel, range(node.lineno, node.end_lineno + 1))
+    # What the modules that still import hold now: registries without the failed modules' classes, and
+    # whatever else the patch changed.
+    keys = [k for k in statediff.diff(S.fp0, statediff.snapshot(S.maps["unstable"]), S.maps["lazy"])
+            if k[1].split(":", 1)[0] not in bad]
+    extra, why = suspects_from_state(keys, old_modules)
+    C.log(f"   state outside the failed modules: {why}: {sorted(keys)[:4]} -> {len(extra)} tests")
+    return out | extra
+
+
 def include_cost(total, big):
     """Cost in ms of running tests of `total` ms, the longest taking `big`, on the best number of workers."""
     if total <= 0:
@@ -925,9 +988,21 @@ def child_main(fd, plan):
         tc = time.process_time()
         if failed:
             # A module that no longer imports breaks every test that would load it, including tests that
-            # only look a dialect up by name. The maps cannot tell those apart, so every test is a suspect.
-            cands = set(S.all)
+            # only look a dialect up by name.
+            users = None
+            if S.failed_on:
+                try:
+                    users = users_of_failed(failed, old_modules)
+                except BaseException as e:
+                    C.log("   failed modules not narrowed:", repr(e)[:200])
             plan = _no_statediff(plan)
+            if users is None or len(users) > len(S.all) // 2:
+                cands = set(S.all)
+            else:
+                cands |= users
+                cands.update(S.unknown)
+                plan.broken = True               # test files that no longer import are found below
+                C.log(f"   {len(failed)} modules do not import: {len(cands)} tests can notice")
         if plan.statediff:
             try:
                 keys = statediff.diff(S.fp0, statediff.snapshot(S.maps["unstable"]), S.maps["lazy"])
@@ -1159,6 +1234,7 @@ def run(out_fd):
     S.dual = os.environ.get("BR_DUAL", "1") != "0"
     S.keys_on = os.environ.get("BR_KEYS", "1") != "0"
     S.nesting = os.environ.get("BR_NESTING", "1") != "0"
+    S.failed_on = os.environ.get("BR_FAILED", "1") != "0"
     stop = os.environ.get("BR_DUAL_STOP", DUAL_STOP)
     S.dual_stop = tuple(int(x) for x in stop.split(",")) if stop else None
     S.no_stmt = set(S.maps.get("no_stmt", ()))

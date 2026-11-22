@@ -1000,8 +1000,17 @@ def reimport(ov):
     importlib.invalidate_caches()
     import sqlglot
     failed = []
-    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+
+    def walk_error(name):
+        # a package that raises while it is imported to look inside it: its modules cannot import either
+        if name not in failed:
+            failed.append(name)
+            log("import failed", name, "(package)")
+
+    for m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot.", onerror=walk_error):
         if m.name.endswith("__main__"):
+            continue
+        if m.name in failed:
             continue
         try:
             importlib.import_module(m.name)

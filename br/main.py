@@ -866,6 +866,24 @@ def users_of_failed(failed, old_modules):
     return out | extra
 
 
+GC_LIMIT = 1500 << 20      # bytes of resident memory above which garbage is collected (the run has 4 GB)
+_PAGE = os.sysconf("SC_PAGE_SIZE")
+
+
+def mem_guard():
+    """The cyclic garbage collector is off (it costs about a fifth of the CPU of a test like TPC-DS, and every
+    commit runs in a short-lived fork); garbage is collected only when resident memory grows large."""
+    if not S.gc_off:
+        return
+    try:
+        with open("/proc/self/statm", "rb") as f:
+            rss = int(f.read().split()[1]) * _PAGE
+    except Exception:
+        rss = GC_LIMIT + 1
+    if rss > GC_LIMIT:
+        gc.collect()
+
+
 def include_cost(total, big):
     """Cost in ms of running tests of `total` ms, the longest taking `big`, on the best number of workers."""
     if total <= 0:
@@ -913,7 +931,7 @@ def run_policy(fd, cands, runner, calls=None, min_evidence=5, dual_stop=None):
         suf_all[i] = suf_all[i + 1] + v[n]
     dirty = False
     for i, n in enumerate(order):
-        if dirty or time.time() - T0 > S.deadline:
+        if dirty or S.no_verify or time.time() - T0 > S.deadline:
             break
         if not fails:
             now = include_cost(rem_total, rem_big) / 1000
@@ -970,6 +988,7 @@ def run_policy(fd, cands, runner, calls=None, min_evidence=5, dual_stop=None):
         except BaseException as e:
             C.disarm()
             ok, err = False, "crash " + repr(e)[:100]
+        mem_guard()
         if ok:
             remaining.discard(n)
             rem_total -= ms[n]
@@ -1027,6 +1046,8 @@ def child_main(fd, plan):
         emit(fd, f"T re-import {time.process_time() - tc:.3f}")
         tc = time.process_time()
         if failed:
+            # modules inside a package that no longer imports cannot import either
+            failed = sorted(set(failed) | {k for k in old_modules if any(k.startswith(f + ".") for f in failed)})
             # A module that no longer imports breaks every test that would load it, including tests that
             # only look a dialect up by name.
             users = None
@@ -1277,6 +1298,10 @@ def run(out_fd):
     S.nesting = os.environ.get("BR_NESTING", "1") != "0"
     S.failed_on = os.environ.get("BR_FAILED", "1") != "0"
     S.gen_replay = os.environ.get("BR_GEN", "1") != "0"
+    S.no_verify = os.environ.get("BR_NOVERIFY", "0") != "0"
+    S.gc_off = os.environ.get("BR_GC", "1") == "1"      # `BR_GC=0` keeps the garbage collector on
+    if S.gc_off:
+        gc.disable()
     S.failed_cap = float(os.environ.get("BR_FAILED_CAP", "1.0"))
     stop = os.environ.get("BR_DUAL_STOP", DUAL_STOP)
     S.dual_stop = tuple(int(x) for x in stop.split(",")) if stop else None

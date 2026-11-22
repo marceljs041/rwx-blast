@@ -25,6 +25,9 @@ def _expr():
     _expr_base = getattr(m, "Expr", None) if m else None
 
 
+_memo = None   # during snapshot(): (id, depth, unordered) -> fingerprint; every object it names stays alive
+
+
 def fp(x, d=0, u=False):
     t = type(x)
     if t in _PRIM:
@@ -32,6 +35,21 @@ def fp(x, d=0, u=False):
         return hash((t.__name__, x if (t is str or t is bytes) else repr(x)))
     if d > 7:
         return hash(t.__qualname__)
+    memo = _memo
+    if memo is not None:
+        key = (id(x), d, u)
+        h = memo.get(key)
+        if h is None:
+            h = memo[key] = _fp(x, t, d, u)
+            _alive.append(x)
+        return h
+    return _fp(x, t, d, u)
+
+
+_alive = []
+
+
+def _fp(x, t, d, u):
     if t is tuple or t is list:
         if u:
             return hash((t.__name__, frozenset(_count([fp(i, d + 1, u) for i in x]))))
@@ -97,7 +115,17 @@ def snapshot(unstable=()):
     """{("g", module, name) | ("c", "module:qualname", attr): fingerprint} for every loaded sqlglot module.
     Keys in `unstable` hold containers whose order comes from iterating a set of classes, which differs from
     one import to the next on the pinned commit itself; those are compared without order."""
+    global _memo
     _expr()
+    _memo = {}
+    try:
+        return _snapshot(unstable)
+    finally:
+        _memo = None
+        _alive.clear()
+
+
+def _snapshot(unstable):
     out = {}
     seen = set()
     refs = set()

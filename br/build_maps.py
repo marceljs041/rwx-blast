@@ -2,6 +2,7 @@
 touches. Everything written here describes the pinned commit only: lines executed, classes instantiated, files
 opened, CPU used, and DuckDB answers to the fixture queries."""
 import ast
+import gc
 import importlib
 import importlib.util
 import json
@@ -706,6 +707,7 @@ def main():
         def run():
             c, _ = R.get_class(tid)
             R.ensure_setup(c)                 # class set-up is paid once per class, not per test
+            gc.disable()                      # as at run time (see main.mem_guard)
             t0 = time.process_time()
             ok = R.run(tid)[0]
             return ok, time.process_time() - t0

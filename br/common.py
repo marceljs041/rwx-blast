@@ -14,10 +14,10 @@ import unittest
 
 from br import stmts
 
-ROOT = os.environ.get("BR_ROOT", "/opt/sqlglot").rstrip("/")
-MAPS = os.environ.get("BR_MAPS", "/opt/br/maps")
-DATA = os.environ.get("BR_DATA", "/data")
-TMP = os.environ.get("BR_TMP", "/tmp")
+ROOT = os.path.abspath(os.environ.get("BR_ROOT", "/opt/sqlglot").rstrip("/"))
+MAPS = os.path.abspath(os.environ.get("BR_MAPS", "/opt/br/maps"))
+DATA = os.path.abspath(os.environ.get("BR_DATA", "/data"))
+TMP = os.path.abspath(os.environ.get("BR_TMP", "/tmp"))
 
 
 def log(*a):
@@ -538,6 +538,83 @@ def diff_tree(o, n, path, out):
     return own or sub
 
 
+def deep_key(c):
+    """sem_key of a code object together with everything nested in it."""
+    return (c.co_qualname, sem_key(c), tuple(deep_key(x) for x in c.co_consts if isinstance(x, types.CodeType)))
+
+
+def all_code(c):
+    """`c` and every code object nested in it."""
+    out = [c]
+    for x in c.co_consts:
+        if isinstance(x, types.CodeType):
+            out.extend(all_code(x))
+    return out
+
+
+def all_lines(c):
+    out = own_lines(c)
+    for x in c.co_consts:
+        if isinstance(x, types.CodeType):
+            out |= all_lines(x)
+    return out
+
+
+def dropped_function_lines(o, n):
+    """Lines of the functions in tree `o` that tree `n` does not hold in identical form under the same
+    qualified name. Class and module bodies are looked into but not counted themselves: they run at import,
+    and what they compute is compared as import state."""
+    have = {}
+
+    def collect(c):
+        for x in c.co_consts:
+            if isinstance(x, types.CodeType):
+                if is_function(x):
+                    k = deep_key(x)
+                    have[k] = have.get(k, 0) + 1
+                else:
+                    collect(x)
+
+    lines = set()
+
+    def walk(c):
+        for x in c.co_consts:
+            if isinstance(x, types.CodeType):
+                if is_function(x):
+                    k = deep_key(x)
+                    if have.get(k, 0) > 0:
+                        have[k] -= 1
+                    else:
+                        lines.update(all_lines(x))
+                else:
+                    walk(x)
+
+    collect(n)
+    walk(o)
+    return lines
+
+
+def diff_functions(o, n, out):
+    """Like diff_tree, but a function is compared as a whole, nested code included: `out` collects (old, new)
+    for every function that differs in any way, and the result says whether a class or module body differs
+    itself. Raises ValueError when a class or module body holds different code objects than before, so that
+    functions cannot be paired by position."""
+    oc = [x for x in o.co_consts if isinstance(x, types.CodeType)]
+    nc = [x for x in n.co_consts if isinstance(x, types.CodeType)]
+    if len(oc) != len(nc):
+        raise ValueError("structure")
+    own = sem_key(o) != sem_key(n)
+    for a, b in zip(oc, nc):
+        if a.co_name != b.co_name or is_function(a) != is_function(b):
+            raise ValueError("structure")
+        if is_function(a):
+            if deep_key(a) != deep_key(b):
+                out.append((a, b))
+        elif diff_functions(a, b, out):
+            own = True
+    return own
+
+
 def own_lines(code):
     return {l for _, _, l in code.co_lines() if l is not None}
 
@@ -622,6 +699,32 @@ def _pretend_pytest():
     sys.modules["pytest"] = _Lazy("pytest")
 
 
+def prime():
+    """sqlglot fills one process-wide table lazily: the dispatch table of each generator class, built from its
+    TRANSFORMS and *_sql methods the first time the class is instantiated and kept in a module-level cache.
+    Building it for every generator class right after the import makes it import state: a change to it shows
+    when import states are compared, and no statement of a test depends on an earlier one having built it."""
+    g = sys.modules.get("sqlglot.generator")
+    build = getattr(g, "_build_dispatch", None)
+    cache = getattr(g, "_DISPATCH_CACHE", None)
+    base = getattr(g, "Generator", None)
+    if not callable(build) or type(cache) is not dict or not isinstance(base, type):
+        return
+    seen = set()
+    stack = [base]
+    while stack:
+        c = stack.pop()
+        if c not in seen:
+            seen.add(c)
+            stack.extend(c.__subclasses__())
+    for c in sorted(seen, key=lambda c: (c.__module__, c.__qualname__)):
+        if c not in cache:
+            try:
+                cache[c] = build(c)
+            except Exception as e:
+                log("dispatch table not built for", c.__qualname__, repr(e)[:80])
+
+
 def warm():
     """Puts the process in the state every test child is forked from: sqlglot fully imported, pools inlined."""
     import pkgutil
@@ -642,6 +745,7 @@ def warm():
         except Exception as e:
             log("skip module", m.name, repr(e)[:80])
     patch_stages()
+    prime()
 
 
 # ---------------------------------------------------------------- DuckDB connections
@@ -828,4 +932,5 @@ def reimport(ov):
             failed.append(m.name)
             log("import failed", m.name, repr(e)[:120])
     patch_stages()
+    prime()
     return failed

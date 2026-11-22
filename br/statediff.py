@@ -62,7 +62,10 @@ def fp(x, d=0, u=False):
     if t is functools.partial:
         return hash(("partial", fp(x.func, d + 1, u), fp(x.args, d + 1, u), fp(x.keywords, d + 1, u)))
     if t is types.MethodType:
-        return hash(("method", fp(x.__func__, d + 1, u), fp(type(x.__self__), d + 1)))
+        # a classmethod bound to a class (exp.Sum.from_arg_list) is told apart by that class; a method bound to
+        # an instance by the instance's class
+        owner = x.__self__ if isinstance(x.__self__, type) else type(x.__self__)
+        return hash(("method", fp(x.__func__, d + 1, u), fp(owner, d + 1), isinstance(x.__self__, type)))
     if isinstance(x, enum.Enum):
         return hash(("enum", t.__module__, t.__qualname__, x.name, fp(x._value_, d + 1, u)))
     if t is re.Pattern:

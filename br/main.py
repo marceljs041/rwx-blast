@@ -18,6 +18,7 @@ from array import array
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from br import common as C
 from br import dual
+from br import keytrack
 from br import statediff
 from br import stmts
 
@@ -80,6 +81,10 @@ def load():
     S.set_cache = {}
     S.lazy_load = [t["number"] for t in S.tests if t["id"].endswith("::test_lazy_load")]
     S.expensive = {k for k, s in m["setup"].items() if s["cpu"] >= 0.3}
+    S.key_read = frozenset(m.get("key_read", ()))
+    S.key_table = (m.get("key_table") or {}) if "key_read" in m else {}
+    S.key_untracked = frozenset(S.idx2num[i] for i in m.get("key_untracked", ()) if S.idx2num[i] is not None) \
+        | frozenset(S.unknown)
     S.memo = None
     S.fidx = None
     S.fp0 = None
@@ -307,13 +312,46 @@ def analyze_python(plan, rel, old, new, changed):
     imp = S.maps["import_funcs"]
     if in_tests:
         plan.reuse_ok = False
+    if not structure and S.nesting and not in_tests:
+        # Code objects cannot be paired one to one. When the difference is confined to function bodies (a
+        # lambda or generator expression inside a function was added or removed), each such function is
+        # still paired with its new version by position in its class or module, and is replaced as a whole.
+        pairs = []
+        try:
+            body_changed = C.diff_functions(ocode, ncode, pairs)
+        except ValueError:
+            body_changed = True
+        if not body_changed and pairs and not any((rel, o.co_firstlineno, o.co_name) in imp for o, _ in pairs) \
+                and not any(x.co_flags & 1 and (rel, x.co_firstlineno, x.co_name) in imp
+                            for o, _ in pairs for x in C.all_code(o)):
+            lines = set()
+            for o, _ in pairs:
+                lines |= C.all_lines(o)
+            plan.cands |= tests_for_lines(rel, lines)
+            plan.lines.setdefault(rel, set()).update(lines)
+            plan.swaps.append((rel, pairs))
+            if not openers(rel):
+                plan.swapped.add(rel)
+            if plan.mode in ("none", "files"):
+                plan.mode = "A"
+            plan.why.append(f"{rel}: {len(pairs)} function(s), nesting changed inside")
+            return True
     if not structure:
-        plan.reuse_ok = False
-        lines = set()
-        spans = statement_spans(old)
-        for l in changed:
-            lines |= enclosing_lines(ocode, l) | statement_lines(spans, l)
-        plan.cands |= tests_for_lines(rel, lines | set(changed))
+        # A function, lambda or class was added or removed, so old and new code objects cannot be paired by
+        # position. A test can be affected through a pinned function that is gone or different (found by the
+        # lines it runs), or through what the import computes (found by comparing import state).
+        if S.nesting:
+            # Units of a test that run none of these functions and cannot see a changed class attribute or
+            # global behave as on the pinned commit, as for any other class-level change.
+            lines = C.dropped_function_lines(ocode, ncode)
+            plan.lines.setdefault(rel, set()).update(lines)
+        else:
+            plan.reuse_ok = False
+            lines = set(changed)
+            spans = statement_spans(old)
+            for l in changed:
+                lines |= enclosing_lines(ocode, l) | statement_lines(spans, l)
+        plan.cands |= tests_for_lines(rel, lines)
         plan.mode = "B"
         plan.why.append(f"{rel}: nesting changed")
         if in_tests:
@@ -627,11 +665,65 @@ def function_lines(key):
     return path[len(C.ROOT) + 1:], lines
 
 
-def suspects_from_state(changed_keys):
+def _table_readers(table, changed, resized, nested):
+    """Build indexes of the tests that asked table `table` for a key in `changed`, took its size (when
+    `resized`), or looked at it as a whole. `nested` gives, for some changed keys, the readers of the inner
+    table behind that key; those replace the readers of the key itself."""
+    if table not in S.key_read:
+        return set()                             # the build saw no test read this table at all
+    with open(os.path.join(C.MAPS, "keys", f"{table}.pkl"), "rb") as f:      # a missing file is an error
+        whole, size, keys = pickle.load(f)
+    idx = set(array("H", whole))
+    if resized:
+        idx.update(array("H", size))
+    for h in changed:
+        inner = nested.get(h)
+        if inner is not None:
+            idx |= inner
+        else:
+            b = keys.get(h)
+            if b is not None:
+                idx.update(array("H", b))
+    return idx
+
+
+def entry_readers(key, old_modules):
+    """Tests that can see how the dict table behind state key `key` changed: those that asked it for an entry
+    that differs, took its size when the size differs, or looked at it as a whole. None when the build has no
+    read record for that table or the two values cannot be compared entry by entry."""
+    table = S.key_table.get(key)
+    if table is None or old_modules is None:
+        return None
+    try:
+        old = keytrack.lookup(old_modules, key)
+        new = keytrack.lookup(sys.modules, key)
+        core = old_modules.get("sqlglot.expressions.core")
+        old_expr = getattr(core, "Expr", None)
+        unordered = key in S.maps["unstable"]
+        ch = keytrack.changed_entries(old, new, old_expr, unordered)
+        if ch is None:
+            return None
+        changed, resized = ch
+        nested = {}
+        for h, (ov, nv) in changed.items():
+            inner = S.key_table.get(key + (h,))
+            if inner is not None and ov is not keytrack.MISSING and nv is not keytrack.MISSING:
+                ch2 = keytrack.changed_entries(ov, nv, old_expr, unordered)
+                if ch2 is not None:
+                    nested[h] = _table_readers(inner, ch2[0], ch2[1], {})
+        idx = _table_readers(table, changed, resized, nested)
+    except Exception as e:
+        C.log("   entry comparison failed:", key, repr(e)[:120])
+        return None
+    return {S.idx2num[i] for i in idx if S.idx2num[i] is not None}
+
+
+def suspects_from_state(changed_keys, old_modules=None):
     """Tests that can see a changed class attribute or module global."""
     if len(changed_keys) > 400:
         return set(S.all), "many state changes"
     out = set()
+    narrowed = 0
     if len({k[2] for k in changed_keys}) > 60:
         return set(S.all), "many names changed"
     for kind, owner, name in changed_keys:
@@ -645,19 +737,31 @@ def suspects_from_state(changed_keys):
             kind = "c" if ":" in owner else "g"
         if kind == "g":
             # a module global is read by name inside its own module, and by attribute or import elsewhere
-            rd, _ = readers(name) if not dunder else (set(), False)
-            out |= rd
+            sus, _ = readers(name) if not dunder else (set(), False)
+            if S.keys_on:
+                seen = entry_readers((kind, owner, name), old_modules)
+                if seen is not None:
+                    narrowed += len(sus) - len(seen | (sus & S.key_untracked))
+                    sus = seen | (sus & S.key_untracked)
+            out |= sus
             continue
         rd, mentioned = readers(name) if not dunder else (set(), False)
         sid = S.maps["classes"].get(owner)
         users = members(sid) if sid is not None else None
         if users is None:
-            out |= rd                           # never instantiated: enum, namespace
+            sus = rd                            # never instantiated: enum, namespace
         elif mentioned:
-            out |= users & rd
+            sus = users & rd
         else:
-            out |= users                        # no textual reader: reached dynamically
-    return out, f"{len(changed_keys)} state changes"
+            sus = users                         # no textual reader: reached dynamically
+        if S.keys_on:
+            seen = entry_readers(("c", owner, name), old_modules)
+            if seen is not None:
+                # tests whose reads were not recorded stay suspects by the rule above
+                narrowed += len(sus) - len(seen | (sus & S.key_untracked))
+                sus = seen | (sus & S.key_untracked)
+        out |= sus
+    return out, f"{len(changed_keys)} state changes" + (f", entry reads spare {narrowed} tests" if narrowed else "")
 
 
 def include_cost(total, big):
@@ -810,6 +914,7 @@ def child_main(fd, plan):
     # DuckDB answers are keyed by query text, so they stay valid unless the data files themselves change.
     S.use_memo = not any(r.startswith("tests/fixtures/") and not r.endswith(".sql") for r in plan.changes)
     if plan.mode == "B":
+        old_modules = {k: m for k, m in sys.modules.items() if k == "sqlglot" or k.startswith("sqlglot.")}
         try:
             failed = C.reimport(ov)
         except BaseException as e:
@@ -826,7 +931,7 @@ def child_main(fd, plan):
         if plan.statediff:
             try:
                 keys = statediff.diff(S.fp0, statediff.snapshot(S.maps["unstable"]), S.maps["lazy"])
-                extra, why = suspects_from_state(keys)
+                extra, why = suspects_from_state(keys, old_modules)
                 if len(keys) <= 60:
                     state_keys = keys
                 C.log(f"   state: {why}: {sorted(keys)[:6]} -> {len(extra)} tests")
@@ -853,6 +958,13 @@ def child_main(fd, plan):
         for rel, pairs in plan.swaps:
             swapped = 0
             for o, n in pairs:
+                inner_o, inner_n = C.all_code(o)[1:], C.all_code(n)[1:]
+                if [c.co_name for c in inner_o] != [c.co_name for c in inner_n]:
+                    # the function is replaced as a whole; an inner function made from the old code earlier
+                    # (a closure kept somewhere) would keep running the old code
+                    for c in inner_o:
+                        if c.co_flags & 1 and S.fidx.get((rel, c.co_firstlineno, c.co_name)):
+                            raise NeedReimport("an inner function of the old code is alive")
                 for f in S.fidx.get((rel, o.co_firstlineno, o.co_name), ()):
                     if f.__code__.co_freevars != n.co_freevars:
                         raise NeedReimport("free variables changed")
@@ -1045,6 +1157,8 @@ def run(out_fd):
     S.stmt = os.environ.get("BR_STMT", "1") != "0"
     S.debug = os.environ.get("BR_DEBUG", "0") != "0"
     S.dual = os.environ.get("BR_DUAL", "1") != "0"
+    S.keys_on = os.environ.get("BR_KEYS", "1") != "0"
+    S.nesting = os.environ.get("BR_NESTING", "1") != "0"
     stop = os.environ.get("BR_DUAL_STOP", DUAL_STOP)
     S.dual_stop = tuple(int(x) for x in stop.split(",")) if stop else None
     S.no_stmt = set(S.maps.get("no_stmt", ()))

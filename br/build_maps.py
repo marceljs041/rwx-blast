@@ -2,6 +2,7 @@
 touches. Everything written here describes the pinned commit only: lines executed, classes instantiated, files
 opened, CPU used, and DuckDB answers to the fixture queries."""
 import ast
+import importlib
 import json
 import os
 import pickle
@@ -12,30 +13,68 @@ from array import array
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from br import common as C
+from br import keytrack
 from br import stmts
 
 ROOT_S = C.ROOT + "/"
+# Test files whose tests are run against recorded DuckDB answers.
+MEMO_FILES = ("tests/test_executor.py", "tests/test_optimizer.py")
 mon = sys.monitoring
 TID = 3
+TID2 = 4
 
 
-def start_line_trace(sink, funcs=None):
+_start_lines = {}
+
+
+def start_line(code, off):
+    """The line a call of `code` starts on. The tracer reports a line only when execution moves to a different
+    one, so a function whose body sits on its first line (a one-line lambda or def) never reports any line."""
+    line = _start_lines.get(code)
+    if line is None:
+        line = code.co_firstlineno
+        for a, b, ln in code.co_lines():
+            if a <= off < b and ln is not None:
+                line = ln
+                break
+        _start_lines[code] = line
+    return line
+
+
+def start_line_trace(sink, funcs=None, skip=None):
+    """Collects (file, line) of sqlglot code as it runs: every line reported by the tracer, and the first
+    line of every code object that is entered. `sink` is a one-item list holding the set to add to."""
     def on_line(code, line):
         fn = code.co_filename
-        if fn.startswith(ROOT_S):
-            sink.add((fn, line))
+        if fn.startswith(ROOT_S) and not (skip and skip(code)):
+            sink[0].add((fn, line))
             if funcs is not None and code.co_flags & 1:
                 funcs.add((fn[len(ROOT_S):], code.co_firstlineno, code.co_name))
         return mon.DISABLE
+
+    def on_enter(code, off):
+        fn = code.co_filename
+        if fn.startswith(ROOT_S) and not (skip and skip(code)):
+            sink[0].add((fn, start_line(code, off)))
+            if funcs is not None and code.co_flags & 1:
+                funcs.add((fn[len(ROOT_S):], code.co_firstlineno, code.co_name))
+        return mon.DISABLE
+
     mon.use_tool_id(TID, "br")
     mon.register_callback(TID, mon.events.LINE, on_line)
     mon.set_events(TID, mon.events.LINE)
+    mon.use_tool_id(TID2, "br-enter")
+    mon.register_callback(TID2, mon.events.PY_START, on_enter)
+    mon.set_events(TID2, mon.events.PY_START)
 
 
 def stop_trace():
     mon.set_events(TID, 0)
     mon.register_callback(TID, mon.events.LINE, None)
     mon.free_tool_id(TID)
+    mon.set_events(TID2, 0)
+    mon.register_callback(TID2, mon.events.PY_START, None)
+    mon.free_tool_id(TID2)
 
 
 def init_codes():
@@ -155,16 +194,13 @@ def traced(fn, inits, per_call=False):
             trace_into(lines)
             mon.restart_events()
 
-    def trace_into(sink):
-        def on_line(code, line):
-            fn_ = code.co_filename
-            if fn_.startswith(ROOT_S):
-                sink.add((fn_, line))
-            return mon.DISABLE
-        mon.register_callback(TID, mon.events.LINE, on_line)
+    sink = [lines]
+
+    def trace_into(target):
+        sink[0] = target
 
     sys.addaudithook(hook)
-    start_line_trace(lines)
+    start_line_trace(sink)
     mon.restart_events()   # lines switched off while tracing the imports must report again
     if per_call:
         C.FC.hook = on_call
@@ -177,6 +213,7 @@ def traced(fn, inits, per_call=False):
     result = fn()
     cpu = time.process_time() - t0
     mon.set_events(TID, 0)
+    mon.set_events(TID2, 0)
     def keys_of(ts):
         out = set()
         for t in ts:
@@ -233,6 +270,122 @@ def run_pool(jobs, workers, tmpdir):
             except Exception:
                 out[key] = None
     return out
+
+
+def key_pass(ids, seconds, workers, tmpdir, go_fd, out_path):
+    """Runs in its own process, forked before any test module is imported: replaces dict tables by tracking
+    copies and runs every test once more, noting which entries it reads. One job per test file imports the
+    file and sets its classes up, then forks once per test; reads made by the import and the set-ups count for
+    every test forked after them. Files whose tests need the recorded DuckDB answers wait for `go_fd`; the
+    others run while the parent process records those answers on one core."""
+    stop_trace()
+    t0 = time.time()
+    os.makedirs(tmpdir, exist_ok=True)
+    spare = max(1, workers - 1)
+
+    # Code that runs while a test file is imported (a dialect defined in the file, a constant computed by a
+    # helper) runs for every test of that file, but inside no test. Module and class bodies of the test files
+    # themselves are left out: every test of a file "runs" those.
+    tests_dir = ROOT_S + "tests/"
+
+    def import_job(mod):
+        def run():
+            lines = set()
+            start_line_trace([lines], skip=lambda c: c.co_filename.startswith(tests_dir) and not c.co_flags & 1)
+            mon.restart_events()
+            try:
+                importlib.import_module(mod)
+            except BaseException:
+                pass
+            mon.set_events(TID, 0)
+            mon.set_events(TID2, 0)
+            return sorted(lines)
+        return run
+
+    by_file = {}
+    for i, tid in enumerate(ids):
+        by_file.setdefault(tid.split("::")[0], []).append((i, tid))
+    test_files = sorted(by_file)
+    modlines = run_pool([(f, import_job(f[:-3].replace("/", "."))) for f in test_files], spare, tmpdir)
+    for name in ("numpy", "pandas", "duckdb"):      # not sqlglot code: no need to import them once per file
+        try:
+            __import__(name)
+        except Exception:
+            pass
+    table = keytrack.install()
+    R = C.Runner()
+    R.instrument = False
+
+    def file_job(members):
+        def run():
+            keytrack.reset()
+            out = {}
+            for i, tid in members:
+                try:
+                    c, _ = R.get_class(tid)
+                    R.ensure_setup(c)
+                except BaseException:
+                    pass
+                path = os.path.join(tmpdir, f"t{i}.pkl")
+                pid = os.fork()
+                if pid == 0:
+                    code = 0
+                    try:
+                        ok = bool(R.run(tid)[0])
+                        with open(path, "wb") as f:
+                            pickle.dump((ok, keytrack.dump()), f, protocol=5)
+                    except BaseException:
+                        code = 1
+                    os._exit(code)
+                os.waitpid(pid, 0)
+                try:
+                    with open(path, "rb") as f:
+                        out[i] = pickle.load(f)
+                    os.unlink(path)
+                except Exception:
+                    out[i] = None
+            return out
+        return run
+
+    def chunks(files):
+        """Jobs of about equal test time; a long file is split, each part importing the file itself."""
+        out = []
+        for f in files:
+            part, t = [], 0.0
+            for i, tid in by_file[f]:
+                part.append((i, tid))
+                t += seconds[i]
+                if t >= 6.0:
+                    out.append((t, part))
+                    part, t = [], 0.0
+            if part:
+                out.append((t, part))
+        out.sort(key=lambda x: x[0])               # run_pool starts from the end: longest first
+        return [((p[0][0], len(p)), file_job(p)) for _, p in out]
+
+    late = [f for f in test_files if f in MEMO_FILES]
+    early = [f for f in test_files if f not in MEMO_FILES]
+    res = {}
+    if table:
+        for r in run_pool(chunks(early), spare, tmpdir).values():
+            res.update(r or {})
+    os.read(go_fd, 1)                       # the DuckDB answers are on disk now
+    try:
+        with open(os.path.join(C.MAPS, "duck.pkl"), "rb") as f:
+            memo = pickle.load(f)
+    except Exception:
+        memo = {}
+    R.after_setup = lambda c: C.wrap_executor(c, memo)
+    if table:
+        for r in run_pool(chunks(late), workers, tmpdir).values():
+            res.update(r or {})
+    with open(out_path, "wb") as f:
+        pickle.dump((table, res, modlines), f, protocol=5)
+    C.log(f"import of test files: {sum(1 for v in modlines.values() if v)} of {len(test_files)} run sqlglot code, "
+          f"{sum(len(v) for v in modlines.values() if v)} lines")
+    C.log(f"key pass: {len(table)} class attributes and globals hold {len(set(table.values()))} tracked tables, "
+          f"{sum(1 for r in res.values() if r and r[0])} of {len(ids)} tests passed with tracking, "
+          f"{time.time() - t0:.1f}s")
 
 
 def test_import_graph():
@@ -295,8 +448,22 @@ def main():
 
     import_lines = set()
     import_funcs = set()
-    start_line_trace(import_lines, import_funcs)
+    start_line_trace([import_lines], import_funcs)
     C.warm()
+    # The pass that records table reads starts from here, before any test module is imported, and waits.
+    key_path = os.path.join(tmpdir, "keys.pkl")
+    go_r, go_w = os.pipe()
+    key_pid = os.fork() if os.environ.get("BR_KEYS", "1") != "0" else -1
+    if key_pid == 0:
+        code = 0
+        try:
+            os.close(go_w)
+            key_pass(ids, [t["seconds"] for t in tests], workers, os.path.join(tmpdir, "keys"), go_r, key_path)
+        except BaseException as e:
+            C.log("key pass failed", repr(e)[:300])
+            code = 1
+        os._exit(code)
+    os.close(go_r)
     R = C.Runner()
     for tid in ids:
         try:
@@ -313,13 +480,31 @@ def main():
                                                                   "test_optimized_tpch"))
                   or i.startswith("tests/test_optimizer.py::TestOptimizer::")]
 
-    def record_memo():
-        memo = {}
-        R.after_setup = lambda c: C.wrap_executor(c, memo, record=True)
-        res = [R.run(i) for i in memo_tests]
-        return memo, res
+    def record_memo(part):
+        def run():
+            memo = {}
+            R.after_setup = lambda c: C.wrap_executor(c, memo, record=True)
+            res = [R.run(i) for i in part]
+            return memo, res
+        return run
 
-    memo, memo_res = run_pool([("memo", record_memo)], 1, tmpdir)["memo"]
+    # Answers are keyed by test class and query text, so parts recorded in separate processes simply merge.
+    sec_of = {t["id"]: t["seconds"] for t in tests}
+    parts = [[0.0, []] for _ in range(max(1, workers))]
+    for tid in sorted(memo_tests, key=lambda x: -sec_of.get(x, 0.0)):
+        slot = min(parts, key=lambda p: p[0])
+        slot[0] += sec_of.get(tid, 0.0)
+        slot[1].append(tid)
+    memo, memo_res = {}, []
+    for r in run_pool([(k, record_memo(p[1])) for k, p in enumerate(parts) if p[1]], workers, tmpdir).values():
+        if r is None:
+            C.log("a DuckDB recording job failed")
+            continue
+        for sec, answers in r[0].items():
+            mine = memo.setdefault(sec, {})
+            for sql, slot in answers.items():
+                mine.setdefault(sql, {}).update(slot)      # a slot holds the answer as rows, as a frame or both
+        memo_res.extend(r[1])
     C.log(f"duck memo: {sum(len(m) for m in memo.values())} queries, "
           f"{sum(not r[0] for r in memo_res)} of {len(memo_res)} tests failed while recording, "
           f"{time.time() - t_start:.1f}s")
@@ -327,6 +512,19 @@ def main():
     with open(os.path.join(out_dir, "duck.pkl"), "wb") as f:
         pickle.dump(memo, f, protocol=5)
     R.after_setup = lambda c: C.wrap_executor(c, memo)
+
+    key_table, key_res, modlines = {}, {}, {}
+    if key_pid > 0:
+        os.write(go_w, b"g")
+        os.close(go_w)
+        try:
+            os.waitpid(key_pid, 0)
+            with open(key_path, "rb") as f:
+                key_table, key_res, modlines = pickle.load(f)
+            os.unlink(key_path)
+        except Exception as e:
+            C.log("no key maps", repr(e)[:200])
+            key_table, key_res, modlines = {}, {}, {}
 
     # Import state that differs between two imports of the unchanged tree (order of set iteration).
     def unstable_job():
@@ -448,6 +646,10 @@ def main():
         if not ok:
             C.log("baseline failure", tid, (err or "")[-200:])
         base_ok.append(bool(ok))
+        at_import = modlines.get(tid.split("::")[0]) or ()
+        tr["lines"].update(at_import)
+        if tr.get("calls"):
+            tr["calls"]["rest_lines"].update(at_import)     # seen outside every unit of the test
         for fn, line in tr["lines"]:
             by_line.setdefault((fidx(fn), line), []).append(i)
         for k in tr["classes"]:
@@ -558,6 +760,40 @@ def main():
             sl.setdefault(fidx(fn), set()).add(line)
         setup_info[k] = dict(cpu=tr["cpu"], lines=sl, opened=sorted(tr["opened"]), state=tr["result"])
 
+    # Table reads: one file per table, so a run loads only the tables a patch changed.
+    key_dir = os.path.join(out_dir, "keys")
+    os.makedirs(key_dir, exist_ok=True)
+    for name in os.listdir(key_dir):         # table ids are only meaningful within one build
+        os.unlink(os.path.join(key_dir, name))
+    key_untracked = []           # tests whose reads are not known: they count as reading everything
+    by_table = {}
+    n_reads = 0
+    for i in range(len(ids)):
+        r = key_res.get(i)
+        if not r or not r[0] or not base_ok[i]:
+            key_untracked.append(i)
+            continue
+        for t in r[1]["whole"]:
+            by_table.setdefault(t, [[], [], {}])[0].append(i)
+        for t in r[1]["len"]:
+            by_table.setdefault(t, [[], [], {}])[1].append(i)
+        for t, hs in r[1]["keys"].items():
+            slot = by_table.setdefault(t, [[], [], {}])[2]
+            n_reads += len(hs)
+            for h in hs:
+                a = slot.get(h)
+                if a is None:
+                    a = slot[h] = array("H")
+                a.append(i)
+    for t, (whole, size, keys) in by_table.items():
+        with open(os.path.join(key_dir, f"{t}.pkl"), "wb") as f:
+            pickle.dump((array("H", whole).tobytes(), array("H", size).tobytes(),
+                         {h: a.tobytes() for h, a in keys.items()}), f, protocol=5)
+    if not key_res:
+        key_table = {}
+    C.log(f"table reads: {len(by_table)} tables read by tests, {n_reads} (test, table, key) reads, "
+          f"{len(key_untracked)} tests without them")
+
     class_sets = {k: set_id(m) for k, m in by_class.items()}
     open_sets = {k: set_id(m) for k, m in by_open.items()}
     set_list = [None] * len(sets)
@@ -571,6 +807,7 @@ def main():
         classes=class_sets, opened=open_sets,
         setup=setup_info, v=v, base_ok=base_ok, core_modules=core,
         test_importers=test_import_graph(),
+        key_table=key_table, key_untracked=key_untracked, key_read=sorted(by_table),
     )
     with open(os.path.join(out_dir, "maps.pkl"), "wb") as f:
         pickle.dump(maps, f, protocol=5)

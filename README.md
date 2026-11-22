@@ -8,8 +8,14 @@ the patched code inside one warm Python process.
 Build time (`br/build_maps.py`, run by the Dockerfile) runs every test of the pinned commit once and records
 facts about the pinned commit only:
 
-- which source lines each test executes, and which each pool call inside a test executes;
+- which source lines each test executes, and which each pool call inside a test executes. Python's line
+  tracer reports nothing for a function whose body sits on its `def` or `lambda` line, so the first line of
+  every function a test enters is recorded as well. Code that runs while a test file is imported counts for
+  every test of that file;
 - which sqlglot classes each test instantiates and which files it opens;
+- which entries of sqlglot's dict tables each test reads (`br/keytrack.py`): every dict that only class
+  attributes or module globals refer to is replaced, for one extra run of the tests, by a dict subclass that
+  notes each key it is asked for, and notes "all of it" for any other use (iteration, copy, comparison);
 - which functions run while sqlglot is imported;
 - the result of every pool call and the DuckDB answer to every fixture query, keyed by their exact input.
 
@@ -23,9 +29,17 @@ Run time (`br/main.py`), per patch:
    objects are swapped onto the live functions in a forked child and the suspects are run.
 3. A change at class or module level, in code that runs at import, or in a test file: the child re-imports
    sqlglot from an overlay tree, compares the imported state with the pinned state (class attributes, module
-   globals), and runs the tests that use what changed.
+   globals), and runs the tests that use what changed. When what changed is a dict table whose reads were
+   recorded, the pinned and patched tables are compared entry by entry, and the suspects are the tests that
+   asked for an entry that differs or looked at the table as a whole. When a function, lambda or class was
+   added or removed, the suspects are the tests that run a pinned function the patched file no longer holds
+   in identical form, plus those found through the import state.
 4. A change to a data file: tests that open it are run against the overlay tree.
 5. Anything not understood selects every test.
+
+sqlglot builds one table lazily: the dispatch table of each generator class, the first time the class is
+instantiated, kept in `sqlglot.generator._DISPATCH_CACHE`. Both at build time and after every re-import these
+tables are built for all generator classes straight away, which makes them import state like any other table.
 
 Suspects are run cheapest first with the project's own `unittest` classes (no pytest); process pools are
 replaced by an inline pool that pickles arguments and results like a spawned worker. A test is selected when
@@ -63,6 +77,7 @@ Two rules are statistical rather than exact (`BR_RISK=0` turns both off):
 - `Dockerfile` — pinned base image, locked packages, sqlglot at the pinned commit, map build.
 - `br/common.py` — patch parsing, overlay trees, inline pool, test runner, code-object diff, packing.
 - `br/statediff.py` — fingerprints of imported classes and module globals.
+- `br/keytrack.py` — records which table entries a test reads; compares two tables entry by entry.
 - `br/stmts.py` — rewrites test methods into skippable statement units.
 - `br/dual.py` — counts disagreements between the old and new operator of a swapped comparison.
 - `br/build_maps.py` — build-time tracer.

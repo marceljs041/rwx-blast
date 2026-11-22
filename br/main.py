@@ -962,8 +962,10 @@ def run_policy(fd, cands, runner, calls=None, min_evidence=5, dual_stop=None):
         limit = max(3.0, 3.0 * max(v[n], ms[n] / 1000) + 2.0)
         C.FC.reuse = C.FC.affected = C.FC.probe = C.FC.probe2 = None
         stmts.SU.affected = None
+        stmts.SU.known = None
         if calls and n in calls:
             stmts.SU.affected = calls[n][1]
+            stmts.SU.known = S.maps["unit_base"][S.num2idx[n]][2]
             if S.maps["unit_base"][S.num2idx[n]][1]:
                 try:
                     with open(os.path.join(C.MAPS, "fut", f"{S.num2idx[n]}.pkl"), "rb") as f:

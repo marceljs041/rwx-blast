@@ -57,7 +57,9 @@ A suspect test is not always run in full:
 - A pool call inside a test (one fixture case, one TPC query) reuses the result recorded on the pinned commit
   when its pickled arguments are byte-identical and it executes no changed statement and uses no changed class.
 - A top-level `self.validate...(...)` or `self.assert...(...)` statement of a test method is skipped under
-  the same condition (`BR_STMT=0` turns this off). Tests whose statements depend on each other are detected at
+  the same condition (`BR_STMT=0` turns this off). So is each `with self.subTest(...)` block inside a loop
+  (one fixture case of a loop over a fixture file), numbered in the order the blocks run; a block the build
+  never saw always runs, and nothing is skipped when the loop itself runs a changed statement. Tests whose statements depend on each other are detected at
   build time and never have statements skipped.
 - A DuckDB query whose exact text was answered on the pinned commit is not executed again.
 

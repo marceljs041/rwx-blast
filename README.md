@@ -38,7 +38,9 @@ Run time (`br/main.py`), per patch:
 5. A module that no longer imports: when plain `import sqlglot` still works, the suspects are the tests that
    run code of the failed modules, make objects of their classes, run an import statement or a line naming
    one of their classes, read an entry now missing from a registry (the dialect registry is one of the
-   recorded tables), or sit in a test file that no longer imports. Otherwise every test is selected.
+   recorded tables), asked for one of the modules by name while running (import statements, `__import__` and
+   `importlib.import_module` are recorded at build time), listed the directory a failed module lives in (as
+   `pkgutil` does), or sit in a test file that no longer imports. Otherwise every test is selected.
 6. Anything not understood selects every test.
 
 sqlglot builds one table lazily: the dispatch table of each generator class, the first time the class is
@@ -62,6 +64,17 @@ A suspect test is not always run in full:
 An executor pool call is also split at its optimizer run: when only that stage can see the change and its
 output is byte-identical to the pinned commit's, the recorded result is used and planning and execution are
 skipped.
+
+The later stage (planning and running the plan) turns expressions into Python code with sqlglot's generator.
+At build time every generator call it makes is recorded: the pickled input, the generator's settings, which
+generator object made the call, and the output. The lines run inside these calls are kept apart from the lines
+the later stage runs elsewhere. When a change is seen in the later stage only inside generator calls (a change
+to `generator.py` or `generators/python.py`, say), the run time replays the recorded calls on the patched code,
+in the same order, on generator objects made with the same settings. If every call returns the recorded output,
+no input was modified, and the optimizer stage's output is byte-identical, the later stage does exactly what it
+did on the pinned commit, and the recorded result is used. Replaying TPC-DS takes about 1 s of CPU, against
+about 10 s for running it. The replay's own work (unpickling, making generators) is traced too: a change to any
+line it runs turns the replay off. `BR_GEN=0` turns the replay off.
 
 Two rules are statistical rather than exact (`BR_RISK=0` turns both off):
 

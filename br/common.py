@@ -181,6 +181,8 @@ class FutureCtx:
     record = None     # build time: {k: (input_hash, pickled_result | None, cpu, stage_hash | None)}
     probe = None      # calls whose later stage runs no changed statement: stop after the first stage if its
                       # output is byte-identical to the pinned commit's
+    probe2 = None     # calls of `probe` whose later stage runs changed statements only inside the executor's
+                      # code generator: they also need the recorded generator calls to reproduce exactly
     cur = None        # the call that is running right now
 
 
@@ -218,8 +220,76 @@ def stage_done(value):
     if FC.record is not None:
         if FC.hook:
             FC.hook(4, fut._k)            # build time: lines from here on belong to the later stage
-    elif h == fut._want:
+    elif h == fut._want and (fut._gens is None or gens_match(fut._gens)):
         raise _Reuse()
+
+
+GEN_ARGS = (("pretty", "pretty"), ("identify", "identify"), ("normalize", "normalize"), ("pad", "pad"),
+            ("_indent", "indent"), ("normalize_functions", "normalize_functions"),
+            ("unsupported_level", "unsupported_level"), ("max_unsupported", "max_unsupported"),
+            ("leading_comma", "leading_comma"), ("max_text_width", "max_text_width"), ("comments", "comments"))
+
+
+def _cls_key(t):
+    return f"{t.__module__}:{t.__qualname__}"
+
+
+def _cls_of(key):
+    mod, _, qual = key.partition(":")
+    obj = sys.modules[mod]
+    for part in qual.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def gen_cfg(gen):
+    """What a generator was made with, as far as its output can depend on it: its class, its dialect's class
+    and settings, and its own arguments."""
+    d = getattr(gen, "dialect", None)
+    dstate = repr((getattr(d, "version", None), getattr(d, "normalization_strategy", None),
+                   sorted(getattr(d, "settings", {}).items())))
+    return (_cls_key(type(gen)), _cls_key(type(d)), dstate, getattr(d, "settings", {}),
+            tuple(getattr(gen, a, None) for a, _ in GEN_ARGS))
+
+
+def make_gen(cfg):
+    gcls, dcls, _, settings, values = cfg
+    d = _cls_of(dcls)(**settings)
+    return _cls_of(gcls)(dialect=d, **{p: v for (_, p), v in zip(GEN_ARGS, values)})
+
+
+def gens_match(g, on=None):
+    """Replays the code generator calls the later stage of a pool call made on the pinned commit, with the code
+    as it is now: the same inputs, in the same order, on as many generator objects made with the same settings.
+    True when every call returns the recorded output and no input was modified.
+
+    The later stage runs changed statements only inside these calls, and is given the same first-stage output,
+    so everything else it does is what it did on the pinned commit. `on` (build time) is told which part runs:
+    "check" for the replay's own work, "gen" for the generator calls."""
+    cfgs, blobs, seq = g
+    try:
+        on and on("check")
+        objs = [pickle.loads(b) for b in blobs]
+        before = [pickle.dumps(o, protocol=5) for o in objs]   # a round trip need not give the same bytes
+        gens = {}
+        for inst, oi, out in seq:
+            gen = gens.get(inst)
+            if gen is None:
+                on and on("check")
+                gen = gens[inst] = make_gen(cfgs[inst])
+                if gen_cfg(gen) != cfgs[inst]:
+                    return False
+            on and on("gen")
+            if gen.generate(objs[oi]) != out:
+                return False
+        on and on("check")
+        return all(pickle.dumps(o, protocol=5) == b for o, b in zip(objs, before))
+    except Timeout:
+        raise
+    except Exception:
+        return False
+    finally:
+        on and on(None)
 
 
 class LazyFuture:
@@ -239,6 +309,7 @@ class LazyFuture:
         self._staged = False
         self._stage_hash = None
         self._want = None
+        self._gens = None
         FC.count += 1
         try:
             self._payload = pickle.dumps((args, kwargs))
@@ -262,7 +333,13 @@ class LazyFuture:
             self._load(ent[1])
             return
         if ent is not None and FC.probe is not None and k in FC.probe and len(ent) > 2 and ent[2] is not None:
-            self._want = ent[2]
+            if FC.probe2 is not None and k in FC.probe2:
+                g = ent[3] if len(ent) > 3 else None
+                if g is not None:
+                    self._want = ent[2]
+                    self._gens = g
+            else:
+                self._want = ent[2]
         if self._pool is not None:
             self._pool._ensure_init()
         hook = FC.hook if (mine and not in_unit) else None

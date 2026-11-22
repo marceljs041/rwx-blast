@@ -163,11 +163,30 @@ def state_mask(changed_keys):
     return mask, late
 
 
-def affected_calls(plan, cands=None, extra_mask=0, with_stmts=False, probes=False, extra_late=None):
-    """{test number: set of pool-call indexes that must really run}, for tests that make pool calls."""
+def gen_replay_ok(plan):
+    """Can recorded code generator calls be replayed for this change? Not when it changes a line the replay
+    itself runs besides those calls (unpickling the inputs, making the generators)."""
+    check = S.maps.get("gen_check")
+    if check is None or "ulines3" not in S.maps:
+        return False
+    for rel, lines in plan.lines.items():
+        f = S.maps["files"].get(rel)
+        if f is not None and check.get(f, set()) & set(lines):
+            return False
+    return True
+
+
+def affected_calls(plan, cands=None, extra_mask=0, with_stmts=False, probes=False, extra_late=None,
+                   gen_probes=False):
+    """{test number: (pool-call indexes that must really run, statement units that must run, calls that may
+    stop after their first stage, those of them that also replay their code generator calls)}, for tests that
+    make pool calls."""
     mask = line_mask(plan.lines) | extra_mask
     # calls whose later stage (after the optimizer run inside execute) can see the change cannot stop early
     late = (line_mask(plan.lines, "ulines2") | (extra_mask if extra_late is None else extra_late)) if probes else None
+    # ... unless it is seen only inside the executor's code generator calls, which can be replayed
+    late3 = line_mask(plan.lines, "ulines3") if (probes and gen_probes and extra_mask == 0 and extra_late is None
+                                                  and gen_replay_ok(plan)) else None
     out = {}
     for n in (plan.cands if cands is None else cands):
         i = S.num2idx.get(n)
@@ -185,10 +204,14 @@ def affected_calls(plan, cands=None, extra_mask=0, with_stmts=False, probes=Fals
         if with_stmts and ns and i not in S.no_stmt and not rest_sees_it:
             units = {k for k in range(ns) if (part >> (nc + k)) & 1}
         probe = set()
+        probe2 = set()
         if late is not None:
             part2 = (late >> base) & ((1 << nc) - 1)
             probe = {k for k in calls if not (part2 >> k) & 1}
-        out[n] = (calls, units, probe)
+            if late3 is not None:
+                part3 = (late3 >> base) & ((1 << nc) - 1)
+                probe2 = {k for k in calls if k not in probe and not (part3 >> k) & 1}
+        out[n] = (calls, units, probe | probe2, probe2)
     return out
 
 
@@ -806,6 +829,22 @@ def users_of_failed(failed, old_modules):
     for key, sid in S.maps["classes"].items():
         if key.split(":", 1)[0] in bad:
             out |= members(sid)
+    # Tests that asked for a failed module by name (import statement, __import__, importlib.import_module), or
+    # listed the directory it lives in (pkgutil and the like find modules that way).
+    dirs = set()
+    for m in bad:
+        path = old_modules[m].__file__[len(C.ROOT) + 1:]
+        d = os.path.dirname(path)
+        dirs.add(d + "/")
+        if path.endswith("__init__.py"):
+            dirs.add(os.path.dirname(d) + "/")
+    for key, sid in S.maps["opened"].items():
+        if key.startswith("import:"):
+            name = key[7:]
+            if any(name == m or name.startswith(m + ".") for m in bad):
+                out |= members(sid)
+        elif key in dirs:
+            out |= members(sid)
     for rel, text in _sources().items():
         if "import" not in text:
             continue
@@ -842,7 +881,7 @@ def run_policy(fd, cands, runner, calls=None, min_evidence=5, dual_stop=None):
     v = S.v
     if calls:
         v = dict(v)
-        for n, (aff, units, probe) in calls.items():
+        for n, (aff, units, probe, _) in calls.items():
             frac = S.maps["call_frac"].get(S.num2idx[n])
             if frac:
                 nc = S.maps["unit_base"][S.num2idx[n]][1]
@@ -903,7 +942,7 @@ def run_policy(fd, cands, runner, calls=None, min_evidence=5, dual_stop=None):
             if delta <= v[n] + min(v[n], 2.0):
                 continue
         limit = max(3.0, 3.0 * max(v[n], ms[n] / 1000) + 2.0)
-        C.FC.reuse = C.FC.affected = C.FC.probe = None
+        C.FC.reuse = C.FC.affected = C.FC.probe = C.FC.probe2 = None
         stmts.SU.affected = None
         if calls and n in calls:
             stmts.SU.affected = calls[n][1]
@@ -913,8 +952,9 @@ def run_policy(fd, cands, runner, calls=None, min_evidence=5, dual_stop=None):
                         C.FC.reuse = pickle.load(f)
                     C.FC.affected = calls[n][0]
                     C.FC.probe = calls[n][2]
+                    C.FC.probe2 = calls[n][3]
                 except Exception:
-                    C.FC.reuse = C.FC.affected = C.FC.probe = None
+                    C.FC.reuse = C.FC.affected = C.FC.probe = C.FC.probe2 = None
         t_run = time.process_time()
         try:
             C.arm(60.0)
@@ -996,7 +1036,7 @@ def child_main(fd, plan):
                 except BaseException as e:
                     C.log("   failed modules not narrowed:", repr(e)[:200])
             plan = _no_statediff(plan)
-            if users is None or len(users) > len(S.all) // 2:
+            if users is None or len(users) > S.failed_cap * len(S.all):
                 cands = set(S.all)
             else:
                 cands |= users
@@ -1065,7 +1105,8 @@ def child_main(fd, plan):
     only_sql = all(r.endswith(".sql") for r in on_disk)
     if only_sql and (plan.mode == "files" or (plan.mode == "A" and not S.conflict_now)):
         calls = affected_calls(plan, cands, 0, S.stmt and plan.mode == "A" and ov is None,
-                               probes=plan.mode == "A" and ov is None)
+                               probes=plan.mode == "A" and ov is None,
+                               gen_probes=plan.mode == "A" and ov is None and S.gen_replay)
     elif plan.mode == "B" and plan.reuse_ok and state_keys is not None:
         try:
             seen, seen_late = state_mask(state_keys)
@@ -1235,6 +1276,8 @@ def run(out_fd):
     S.keys_on = os.environ.get("BR_KEYS", "1") != "0"
     S.nesting = os.environ.get("BR_NESTING", "1") != "0"
     S.failed_on = os.environ.get("BR_FAILED", "1") != "0"
+    S.gen_replay = os.environ.get("BR_GEN", "1") != "0"
+    S.failed_cap = float(os.environ.get("BR_FAILED_CAP", "1.0"))
     stop = os.environ.get("BR_DUAL_STOP", DUAL_STOP)
     S.dual_stop = tuple(int(x) for x in stop.split(",")) if stop else None
     S.no_stmt = set(S.maps.get("no_stmt", ()))

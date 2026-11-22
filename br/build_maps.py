@@ -3,6 +3,7 @@ touches. Everything written here describes the pinned commit only: lines execute
 opened, CPU used, and DuckDB answers to the fixture queries."""
 import ast
 import importlib
+import importlib.util
 import json
 import os
 import pickle
@@ -111,7 +112,10 @@ def traced(fn, inits, per_call=False):
     opened = set()
     call_lines = {}   # (file, line) -> bitmask of calls
     call_lines2 = {}  # the same, for the later stage of staged calls only
-    state = {"sink": lines, "cur": None, "types": None, "t0": 0.0}
+    call_lines3 = {}  # the same, for the later stage outside the executor's code generator calls
+    gen_rec = {}      # k -> the code generator calls made by the later stage of call k
+    check_lines = set()  # lines the run-time replay of generator calls runs besides the calls themselves
+    state = {"sink": lines, "cur": None, "types": None, "t0": 0.0, "gk": None, "gdepth": 0}
     call_types = {}   # k -> types instantiated inside that call
     setup_types = set()
     rest_types = set()   # instantiated outside every unit: such objects can be used by any statement unit
@@ -154,18 +158,26 @@ def traced(fn, inits, per_call=False):
             return
         if phase == 4:                       # first stage of a staged call is over
             state["cur2"] = set()
+            state["gin"] = set()
+            state["gk"] = k
+            gen_rec[k] = dict(ok=True, cfgs=[], blobs=[], ids={}, gens={}, seq=[])
             trace_into(state["cur2"])
             mon.restart_events()
             return
         if phase == 0:
             state["cur"] = set()
             state["cur2"] = None
+            state["gk"] = None
             state["types"] = call_types.setdefault(k, set())
             trace_into(state["cur"])
         else:
             state["types"] = None
+            state["gk"] = None
             if state["cur2"] is not None:
                 bit2 = 1 << k
+                for key in state["cur2"]:
+                    call_lines3[key] = call_lines3.get(key, 0) | bit2
+                state["cur2"] |= state["gin"]
                 for key in state["cur2"]:
                     call_lines2[key] = call_lines2.get(key, 0) | bit2
                 state["cur"] |= state["cur2"]
@@ -199,6 +211,86 @@ def traced(fn, inits, per_call=False):
     def trace_into(target):
         sink[0] = target
 
+    # The later stage of a staged pool call turns expressions into Python code with the executor's generator.
+    # Each such call is recorded (input, output, which generator object), and the lines it runs are kept apart
+    # from the rest of the later stage: when a change is seen only inside these calls, replaying them at run
+    # time decides whether the later stage can behave differently.
+    G = sys.modules.get("sqlglot.generator") if per_call else None
+    real_gen = vars(G.Generator).get("generate") if G is not None else None
+
+    def generate(self, expression, copy=True):
+        k = state["gk"]
+        fut = C.FC.cur
+        if k is None or state["gdepth"] or fut is None or fut._k != k or stmts.SU.active:
+            return real_gen(self, expression, copy)
+        rec = gen_rec[k]
+        prev = sink[0]
+        state["gdepth"] += 1
+        oi = inst = None
+        try:
+            if rec["ok"]:
+                trace_into(check_lines)
+                mon.restart_events()
+                try:
+                    if copy is not True:
+                        rec["ok"] = False
+                    blob = pickle.dumps(expression, protocol=5)
+                    oi = rec["ids"].get(blob)
+                    if oi is None:
+                        oi = rec["ids"][blob] = len(rec["blobs"])
+                        rec["blobs"].append(blob)
+                    if id(self) not in rec["gens"]:
+                        rec["gens"][id(self)] = (len(rec["gens"]), self)
+                        rec["cfgs"].append(C.gen_cfg(self))
+                    inst = rec["gens"][id(self)][0]
+                except Exception:
+                    rec["ok"] = False
+            trace_into(state["gin"])
+            mon.restart_events()
+            try:
+                out = real_gen(self, expression, copy)
+            except BaseException:
+                rec["ok"] = False
+                raise
+            if rec["ok"]:
+                rec["seq"].append((inst, oi, out))
+            return out
+        finally:
+            state["gdepth"] -= 1
+            trace_into(prev)
+            mon.restart_events()
+
+    # Modules asked for by name, through import statements, __import__ or importlib.import_module, recorded as
+    # "import:<module>" among the opened paths: a test that asks for a module needs it to import.
+    import builtins
+    import importlib as _il
+    real_import = builtins.__import__
+    real_import_module = _il.import_module
+
+    def note(name):
+        if name.startswith("sqlglot"):
+            opened.add("import:" + name)
+
+    def imp(name, globals=None, locals=None, fromlist=(), level=0):
+        try:
+            full = name
+            if level:
+                full = _il._bootstrap._resolve_name(name, (globals or {}).get("__package__") or "", level)
+            note(full)
+            for f in fromlist or ():
+                if isinstance(f, str) and f != "*":
+                    note(f"{full}.{f}")
+        except Exception:
+            pass
+        return real_import(name, globals, locals, fromlist, level)
+
+    def import_module(name, package=None):
+        try:
+            note(_il.util.resolve_name(name, package) if name.startswith(".") else name)
+        except Exception:
+            pass
+        return real_import_module(name, package)
+
     sys.addaudithook(hook)
     start_line_trace(sink)
     mon.restart_events()   # lines switched off while tracing the imports must report again
@@ -206,12 +298,41 @@ def traced(fn, inits, per_call=False):
         C.FC.hook = on_call
         C.FC.record = {}
         stmts.SU.hook = on_unit
+        if real_gen is not None:
+            G.Generator.generate = generate
     mon.register_callback(TID, mon.events.PY_START, on_start)
     for code in inits:
         mon.set_local_events(TID, code, mon.events.PY_START)
     t0 = time.process_time()
-    result = fn()
+    builtins.__import__ = imp
+    _il.import_module = import_module
+    try:
+        result = fn()
+    finally:
+        builtins.__import__ = real_import
+        _il.import_module = real_import_module
+        if real_gen is not None:
+            G.Generator.generate = real_gen
     cpu = time.process_time() - t0
+    # Replays every recorded set of generator calls on the pinned code, as the run time would: only a set that
+    # reproduces itself is kept. The replay's own lines (unpickling, making generators) are recorded: a change
+    # to any of them rules the replay out.
+    gens_out = {}
+    scratch = set()
+
+    def on_part(part):
+        trace_into(check_lines if part == "check" else scratch)
+        mon.restart_events()
+
+    for k, rec in gen_rec.items():
+        if rec["ok"] and rec["seq"] and k in (C.FC.record or {}):
+            g = (rec["cfgs"], rec["blobs"], rec["seq"])
+            if C.gens_match(g, on_part):
+                gens_out[k] = g
+        if os.environ.get("BR_GEN_DEBUG"):  # build diagnostics
+            sys.stderr.write(f"GEN k={k} ok={rec['ok']} seq={len(rec['seq'])} gens={len(rec['cfgs'])} "
+                             f"rec={k in (C.FC.record or {})} kept={k in gens_out}\n")
+    trace_into(lines)
     mon.set_events(TID, 0)
     mon.set_events(TID2, 0)
     def keys_of(ts):
@@ -231,7 +352,8 @@ def traced(fn, inits, per_call=False):
                 for key in keys_of(ts):
                     out[key] = out.get(key, 0) | (1 << k)
             return out
-        calls = dict(record=C.FC.record, lines=call_lines, lines2=call_lines2, classes=class_masks(call_types),
+        calls = dict(record=C.FC.record, lines=call_lines, lines2=call_lines2, lines3=call_lines3, gens=gens_out,
+                     gen_check=check_lines, classes=class_masks(call_types),
                      rest_lines=set(lines),
                      setup_classes=keys_of(setup_types), rest_classes=keys_of(rest_types),
                      stmt_lines=stmt_lines, stmt_classes=class_masks(stmt_types), stmt_cpu=stmt_cpu)
@@ -666,6 +788,9 @@ def main():
     call_frac = {}
     masks = {}
     masks2 = {}
+    masks3 = {}
+    gen_check = {}
+    n_gens = 0
     cmasks = {}
     n_units = 0
     n_stmt_units = 0
@@ -691,7 +816,9 @@ def main():
                        [min(1.0, scpu.get(k, 0.0) / total) for k in range(ns)]
         if rec:
             with open(os.path.join(fut_dir, f"{i}.pkl"), "wb") as f:
-                pickle.dump({k: (r[0], r[1], r[3]) for k, r in rec.items()}, f, protocol=5)
+                gens = calls.get("gens") or {}
+                pickle.dump({k: (r[0], r[1], r[3], gens.get(k)) for k, r in rec.items()}, f, protocol=5)
+                n_gens += len(gens)
             payload_bytes += sum(len(r[1]) for r in rec.values() if r[1])
             n_staged += sum(1 for r in rec.values() if r[3] is not None)
         for (fn, line), m in calls["lines"].items():
@@ -700,6 +827,11 @@ def main():
         for (fn, line), m in calls["lines2"].items():
             key = (fidx(fn), line)
             masks2[key] = masks2.get(key, 0) | (m << n_units)
+        for (fn, line), m in calls.get("lines3", {}).items():
+            key = (fidx(fn), line)
+            masks3[key] = masks3.get(key, 0) | (m << n_units)
+        for fn, line in calls.get("gen_check", ()):
+            gen_check.setdefault(fidx(fn), set()).add(line)
         for (fn, line), m in calls["stmt_lines"].items():
             key = (fidx(fn), line)
             masks[key] = masks.get(key, 0) | (m << (n_units + n))
@@ -730,6 +862,13 @@ def main():
         if j is None:
             j = bitsets[b] = len(bitsets)
         ulines2.setdefault(f, {})[line] = j
+    ulines3 = {}
+    for (f, line), m in masks3.items():
+        b = m.to_bytes(nbytes, "little")
+        j = bitsets.get(b)
+        if j is None:
+            j = bitsets[b] = len(bitsets)
+        ulines3.setdefault(f, {})[line] = j
     uclasses = {}
     for key, m in cmasks.items():
         b = m.to_bytes(nbytes, "little")
@@ -743,7 +882,7 @@ def main():
     C.log(f"units: {n_units - n_stmt_units - len(unit_base)} pool calls ({n_staged} staged) and {n_stmt_units} statements "
           f"in {len(unit_base)} tests, "
           f"{payload_bytes // 1024} KiB of results, {len(bit_list)} distinct unit sets, "
-          f"{len(no_stmt)} tests with dependent statements")
+          f"{len(no_stmt)} tests with dependent statements, {n_gens} calls with replayable generator calls")
 
     lines = {}
     for (f, line), members in by_line.items():
@@ -802,7 +941,7 @@ def main():
     maps = dict(
         tests=ids, files=files, sets=set_list, lines=lines, import_lines=imp,
         import_funcs=import_funcs, unstable=unstable, lazy=lazy,
-        unit_base=unit_base, call_frac=call_frac, ulines=ulines, ulines2=ulines2, uclasses=uclasses, ubits=bit_list,
+        unit_base=unit_base, call_frac=call_frac, ulines=ulines, ulines2=ulines2, ulines3=ulines3, gen_check=gen_check, uclasses=uclasses, ubits=bit_list,
         no_stmt=no_stmt,
         classes=class_sets, opened=open_sets,
         setup=setup_info, v=v, base_ok=base_ok, core_modules=core,

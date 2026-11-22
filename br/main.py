@@ -913,7 +913,7 @@ def run_policy(fd, cands, runner, calls=None, min_evidence=5, dual_stop=None):
         suf_all[i] = suf_all[i + 1] + v[n]
     dirty = False
     for i, n in enumerate(order):
-        if dirty or time.time() - T0 > S.deadline:
+        if dirty or S.no_verify or time.time() - T0 > S.deadline:
             break
         if not fails:
             now = include_cost(rem_total, rem_big) / 1000
@@ -1277,6 +1277,7 @@ def run(out_fd):
     S.nesting = os.environ.get("BR_NESTING", "1") != "0"
     S.failed_on = os.environ.get("BR_FAILED", "1") != "0"
     S.gen_replay = os.environ.get("BR_GEN", "1") != "0"
+    S.no_verify = os.environ.get("BR_NOVERIFY", "1") != "0"   # diagnostic build: no test is run
     S.failed_cap = float(os.environ.get("BR_FAILED_CAP", "1.0"))
     stop = os.environ.get("BR_DUAL_STOP", DUAL_STOP)
     S.dual_stop = tuple(int(x) for x in stop.split(",")) if stop else None
